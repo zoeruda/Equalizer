@@ -36,9 +36,30 @@ fn db_of(y: f64, h: f64, range: f64) -> f64 {
 }
 
 /// Where a band's handle sits: pass and notch filters have no gain, so they rest on 0 dB.
+/// Imported files can go past the graph's frequencies, and those bands rest on its edge so
+/// they can still be grabbed.
 fn handle_pos(b: &Band, w: f64, h: f64, range: f64) -> (f64, f64) {
     let db = if b.kind.uses_gain() { b.gain } else { 0.0 };
-    (x_of(b.freq, w), y_of(db, h, range))
+    (x_of(b.freq, w).clamp(0.0, w), y_of(db, h, range))
+}
+
+/// A band's frequency during a drag. One past the graph's edge keeps its exact frequency,
+/// so changing only its gain doesn't change it, until it's dragged inward.
+fn dragged_freq(start_freq: f64, start_x: f64, dx: f64, w: f64) -> f64 {
+    let x = start_x + dx;
+    if (start_freq < FREQ_MIN && x <= 0.0) || (start_freq > FREQ_MAX && x >= w) {
+        return start_freq;
+    }
+    f_of(x, w).clamp(FREQ_MIN, FREQ_MAX)
+}
+
+/// A band's frequency after an arrow key. One past the graph's edge stays put when stepped
+/// further out, and comes to the edge when stepped inward.
+fn stepped_freq(freq: f64, factor: f64) -> f64 {
+    if (freq < FREQ_MIN && factor < 1.0) || (freq > FREQ_MAX && factor > 1.0) {
+        return freq;
+    }
+    (freq * factor).clamp(FREQ_MIN, FREQ_MAX)
 }
 
 fn hit(bands: &[Band], x: f64, y: f64, w: f64, h: f64, range: f64) -> Option<usize> {
@@ -59,6 +80,7 @@ fn hit(bands: &[Band], x: f64, y: f64, w: f64, h: f64, range: f64) -> Option<usi
 struct Drag {
     band: usize,
     start: (f64, f64),
+    start_freq: f64,
 }
 
 pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
@@ -128,12 +150,12 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
             let s = ctx.state.borrow();
             let bands = &s.chain(dir).sound.bands;
             let found = hit(bands, x, y, w, h, RANGE);
-            let start = found.map(|i| handle_pos(&bands[i], w, h, RANGE));
+            let start = found.map(|i| (handle_pos(&bands[i], w, h, RANGE), bands[i].freq));
             drop(s);
             area2.grab_focus();
             match (found, start) {
-                (Some(band), Some(start)) => {
-                    *dragging.borrow_mut() = Some(Drag { band, start });
+                (Some(band), Some((start, start_freq))) => {
+                    *dragging.borrow_mut() = Some(Drag { band, start, start_freq });
                     ctx.select(dir, band);
                     area2.set_cursor_from_name(Some("grabbing"));
                     g.set_state(gtk::EventSequenceState::Claimed);
@@ -150,7 +172,7 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
             let Some(d) = *dragging.borrow() else { return };
             let (w, h) = (area2.width() as f64, area2.height() as f64 - AXIS_H);
             ctx.edit_band(dir, d.band, |b| {
-                b.freq = f_of(d.start.0 + dx, w).clamp(FREQ_MIN, FREQ_MAX);
+                b.freq = dragged_freq(d.start_freq, d.start.0, dx, w);
                 if b.kind.uses_gain() {
                     let db = db_of(d.start.1 + dy, h, RANGE).clamp(-GAIN_LIMIT, GAIN_LIMIT);
                     b.gain = if db.abs() < SNAP_DB { 0.0 } else { (db * 10.0).round() / 10.0 };
@@ -225,8 +247,8 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
             match key {
                 Key::Up => ctx.edit_band(dir, i, |b| b.gain = (b.gain + db_step).clamp(-GAIN_LIMIT, GAIN_LIMIT)),
                 Key::Down => ctx.edit_band(dir, i, |b| b.gain = (b.gain - db_step).clamp(-GAIN_LIMIT, GAIN_LIMIT)),
-                Key::Right => ctx.edit_band(dir, i, |b| b.freq = (b.freq * f_step).clamp(FREQ_MIN, FREQ_MAX)),
-                Key::Left => ctx.edit_band(dir, i, |b| b.freq = (b.freq / f_step).clamp(FREQ_MIN, FREQ_MAX)),
+                Key::Right => ctx.edit_band(dir, i, |b| b.freq = stepped_freq(b.freq, f_step)),
+                Key::Left => ctx.edit_band(dir, i, |b| b.freq = stepped_freq(b.freq, 1.0 / f_step)),
                 // Holding Shift turns Tab into a different key, ISO_Left_Tab.
                 Key::Tab | Key::KP_Tab => ctx.select(dir, next_band(i, count, fine)),
                 Key::ISO_Left_Tab => ctx.select(dir, next_band(i, count, true)),
@@ -479,5 +501,45 @@ mod tests {
         let (x, y) = handle_pos(&bands[1], 800.0, 400.0, 12.0);
         assert_eq!(hit(&bands, x + 3.0, y - 3.0, 800.0, 400.0, 12.0), Some(1));
         assert_eq!(hit(&bands, x, y + 80.0, 800.0, 400.0, 12.0), None);
+    }
+
+    #[test]
+    fn points_past_the_graph_can_still_be_clicked() {
+        let bands = vec![Band::bell(10.0, 3.0, 1.0), Band::bell(24_000.0, -3.0, 1.0)];
+        let (low_x, low_y) = handle_pos(&bands[0], 800.0, 400.0, 12.0);
+        let (high_x, high_y) = handle_pos(&bands[1], 800.0, 400.0, 12.0);
+        assert_eq!(low_x, 0.0);
+        assert_eq!(high_x, 800.0);
+        assert_eq!(hit(&bands, 2.0, low_y, 800.0, 400.0, 12.0), Some(0));
+        assert_eq!(hit(&bands, 798.0, high_y, 800.0, 400.0, 12.0), Some(1));
+    }
+
+    #[test]
+    fn dragging_a_point_past_the_graph_keeps_its_frequency_until_it_moves_inward() {
+        let w = 800.0;
+        assert_eq!(dragged_freq(10.0, 0.0, 0.0, w), 10.0, "straight up or down");
+        assert_eq!(dragged_freq(10.0, 0.0, -30.0, w), 10.0, "further out");
+        assert!((dragged_freq(10.0, 0.0, w / 3.0, w) - 200.0).abs() < 0.001, "inward");
+        assert_eq!(dragged_freq(24_000.0, w, 0.0, w), 24_000.0);
+        assert_eq!(dragged_freq(24_000.0, w, 30.0, w), 24_000.0);
+        assert!((dragged_freq(24_000.0, w, -w / 3.0, w) - 2000.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dragging_a_point_on_the_graph_still_stops_at_its_edges() {
+        let w = 800.0;
+        let x = x_of(1000.0, w);
+        assert!((dragged_freq(1000.0, x, 0.0, w) - 1000.0).abs() < 0.001);
+        assert_eq!(dragged_freq(1000.0, x, -w, w), FREQ_MIN);
+        assert_eq!(dragged_freq(1000.0, x, w, w), FREQ_MAX);
+    }
+
+    #[test]
+    fn arrow_keys_bring_a_point_past_the_graph_inward_but_never_further_out() {
+        assert_eq!(stepped_freq(10.0, 0.97), 10.0);
+        assert_eq!(stepped_freq(10.0, 1.03), FREQ_MIN);
+        assert_eq!(stepped_freq(24_000.0, 1.03), 24_000.0);
+        assert_eq!(stepped_freq(24_000.0, 0.97), FREQ_MAX);
+        assert!((stepped_freq(1000.0, 1.03) - 1030.0).abs() < 0.001);
     }
 }

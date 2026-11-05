@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 </p>
 
-> **Early release:** this is version 0.0.2, so expect rough edges and changes between versions.
+> **Early release:** this is version 0.0.3, so expect rough edges and changes between versions.
 
 ![Equalizer's graph with five bands over a live spectrum, with the effect chain in the sidebar](docs/screenshot.png)
 
@@ -46,6 +46,20 @@ verify the download.
 Don't run the Flatpak and an `./install.sh` copy at the same time, as they would
 create the same audio devices. While `install.sh`'s launcher exists, it also takes
 the place of the Flatpak's in the app grid.
+
+### Permissions
+
+To create its virtual devices and route sound, the Flatpak connects directly to
+PipeWire (`xdg-run/pipewire-0`) and identifies itself as an audio manager. This means
+the sandbox doesn't limit what it can do with audio: it can see every audio device and
+stream, record from them, including microphones, and change where sound goes.
+
+The sandbox still limits the rest. The Flatpak has no network access, and apart from
+its own settings, it can only read files you choose to import. It also has access to
+your display and graphics hardware to draw its window.
+
+A copy from `./install.sh` has no sandbox, so it runs with all the access your user
+account has.
 
 ### Build from source
 

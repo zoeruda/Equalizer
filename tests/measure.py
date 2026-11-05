@@ -2,9 +2,10 @@
 """End-to-end audio test: runs the real app and measures what it does to sound.
 
 Everything plays into a temporary silent device, so nothing reaches the speakers.
-It needs an X display (DISPLAY) for the window. Usage: tests/measure.py BINARY
+The app's virtual device is set to 100% while the test runs, then back to its saved
+volume. It needs an X display (DISPLAY) for the window. Usage: tests/measure.py BINARY
 """
-import json, math, os, shutil, signal, struct, subprocess, sys, tempfile, time, wave
+import json, math, os, re, shutil, signal, struct, subprocess, sys, tempfile, time, wave
 
 BIN = os.path.abspath(sys.argv[1])
 RATE = 48000
@@ -121,11 +122,21 @@ class App:
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
         self.p = subprocess.Popen([BIN], env=env, stderr=subprocess.DEVNULL)
         time.sleep(1.8)
+        # WirePlumber restores whatever volume this device last had, which would
+        # shift every measurement. The raw values keep any left/right difference.
+        self.volume = re.findall(r": (\d+) /", run("pactl", "get-sink-volume", "equalizer_sink"))
+        if not self.volume:
+            self.p.terminate()
+            self.p.wait()
+            run("pactl", "unload-module", module)
+            sys.exit("Couldn't read the volume of the app's virtual device")
+        run("pactl", "set-sink-volume", "equalizer_sink", "100%")
 
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
+        run("pactl", "set-sink-volume", "equalizer_sink", *self.volume)
         self.p.terminate()
         self.p.wait()
         time.sleep(0.3)

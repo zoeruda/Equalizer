@@ -461,6 +461,32 @@ impl Sound {
         }
         self.effects.get(effect).is_some_and(|e| e.enabled)
     }
+
+    /// Brings every value into the range the app allows. Imported and saved files can
+    /// contain anything, and the sliders and graph only limit what's changed through them.
+    pub fn sanitize(&mut self) {
+        self.bands.truncate(MAX_BANDS);
+        for band in &mut self.bands {
+            band.freq = limited(band.freq, 10.0, 24_000.0, 1000.0);
+            band.gain = limited(band.gain, -GAIN_LIMIT, GAIN_LIMIT, 0.0);
+            band.q = limited(band.q, 0.1, 20.0, 1.0);
+        }
+        self.preamp = limited(self.preamp, -GAIN_LIMIT, GAIN_LIMIT, 0.0);
+        self.balance = limited(self.balance, -100.0, 100.0, 0.0);
+        for spec in EFFECTS {
+            let Some(state) = self.effects.get_mut(spec.id) else { continue };
+            for param in spec.params {
+                if let Some(v) = state.params.get_mut(param.id) {
+                    *v = limited(*v, param.min, param.max, param.default);
+                }
+            }
+        }
+    }
+}
+
+/// A value within its range. Infinity and NaN become the default, as `clamp` leaves NaN as it is.
+fn limited(v: f64, min: f64, max: f64, default: f64) -> f64 {
+    if v.is_finite() { v.clamp(min, max) } else { default }
 }
 
 fn db_to_g(db: f64) -> f32 {
@@ -574,10 +600,13 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn load_state() -> AppState {
-    std::fs::read(config_dir().join("state.json"))
+    let mut state: AppState = std::fs::read(config_dir().join("state.json"))
         .ok()
         .and_then(|d| serde_json::from_slice(&d).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    state.output.sound.sanitize();
+    state.mic.sound.sanitize();
+    state
 }
 
 pub fn save_state(s: &AppState) -> std::io::Result<()> {
@@ -640,8 +669,9 @@ pub fn user_presets() -> Vec<(String, Sound)> {
             let path = e.path();
             if path.extension().is_some_and(|x| x == "json")
                 && let (Some(stem), Ok(data)) = (path.file_stem(), std::fs::read(&path))
-                && let Ok(sound) = serde_json::from_slice(&data)
+                && let Ok(mut sound) = serde_json::from_slice::<Sound>(&data)
             {
+                sound.sanitize();
                 out.push((stem.to_string_lossy().into_owned(), sound));
             }
         }
@@ -671,6 +701,12 @@ pub fn save_preset(name: &str, sound: &Sound) -> std::io::Result<()> {
     std::fs::write(path, serde_json::to_vec_pretty(sound).expect("sound serializes"))
 }
 
+/// A number from an APO file. Rust also reads "NaN" and "inf" as numbers, but they
+/// aren't usable settings, so they count as unreadable.
+fn apo_number(word: &str) -> Option<f64> {
+    word.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 /// Reads an Equalizer APO / AutoEq file, the format headphone correction
 /// presets are usually shared in.
 pub fn parse_apo(text: &str) -> Result<Sound, String> {
@@ -680,8 +716,8 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Preamp:") {
-            let v = rest.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
-            sound.preamp = v.ok_or("The Preamp line isn't readable")?.clamp(-GAIN_LIMIT, GAIN_LIMIT);
+            let v = rest.split_whitespace().next().and_then(apo_number);
+            sound.preamp = v.ok_or("The Preamp line isn't readable")?;
         } else if line.starts_with("Filter") {
             let words: Vec<&str> = line.split_whitespace().collect();
             let Some(on) = words.iter().position(|w| *w == "ON" || *w == "OFF") else {
@@ -704,7 +740,7 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
                     .iter()
                     .position(|w| *w == key)
                     .and_then(|i| words.get(i + 1))
-                    .and_then(|v| v.parse::<f64>().ok())
+                    .and_then(|v| apo_number(v))
             };
             let Some(freq) = value("Fc") else { continue };
             if sound.bands.len() == MAX_BANDS {
@@ -713,11 +749,9 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
             }
             sound.bands.push(Band {
                 kind,
-                freq: freq.clamp(10.0, 24_000.0),
-                gain: value("Gain").unwrap_or(0.0).clamp(-GAIN_LIMIT, GAIN_LIMIT),
-                q: value("Q")
-                    .unwrap_or(if kind == FilterKind::Bell { 1.0 } else { 0.71 })
-                    .clamp(0.1, 20.0),
+                freq,
+                gain: value("Gain").unwrap_or(0.0),
+                q: value("Q").unwrap_or(if kind == FilterKind::Bell { 1.0 } else { 0.71 }),
                 enabled: words[on] == "ON",
             });
         }
@@ -729,6 +763,7 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
             "This doesn't look like an APO file".into()
         });
     }
+    sound.sanitize();
     Ok(sound)
 }
 
@@ -749,6 +784,65 @@ mod tests {
     #[test]
     fn apo_import_rejects_other_files() {
         assert!(parse_apo("hello\nworld").is_err());
+    }
+
+    #[test]
+    fn apo_import_limits_extreme_values() {
+        let s = parse_apo("Preamp: 500 dB\nFilter 1: ON PK Fc 99999 Hz Gain -500 dB Q 900\n").unwrap();
+        assert_eq!(s.preamp, GAIN_LIMIT);
+        assert_eq!(s.bands[0], Band::bell(24_000.0, -GAIN_LIMIT, 20.0));
+    }
+
+    #[test]
+    fn apo_import_refuses_numbers_that_are_not_finite() {
+        for word in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            assert!(parse_apo(&format!("Preamp: {word} dB\nFilter 1: ON PK Fc 100 Hz Gain 1 dB Q 1\n")).is_err());
+            // A filter with no usable frequency is skipped, like one without any.
+            assert!(parse_apo(&format!("Filter 1: ON PK Fc {word} Hz Gain 1 dB Q 1\n")).is_err());
+            // A missing gain or width falls back as usual.
+            let s = parse_apo(&format!("Filter 1: ON PK Fc 100 Hz Gain {word} dB Q {word}\n")).unwrap();
+            assert_eq!(s.bands[0], Band::bell(100.0, 0.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn sanitize_brings_every_value_into_range() {
+        let mut s = Sound::flat();
+        s.preamp = 1000.0;
+        s.balance = f64::NAN;
+        s.bands = vec![Band::bell(f64::NAN, f64::INFINITY, -5.0); MAX_BANDS + 5];
+        let limiter = effect("limiter");
+        let param = &limiter.params[0];
+        s.effects.get_mut("limiter").unwrap().params.insert(param.id.into(), f64::NAN);
+        let loudness = effect("loudness").params[0].id;
+        s.effects.get_mut("loudness").unwrap().params.insert(loudness.into(), 1e300);
+
+        s.sanitize();
+
+        assert_eq!(s.preamp, GAIN_LIMIT);
+        assert_eq!(s.balance, 0.0);
+        assert_eq!(s.bands.len(), MAX_BANDS);
+        assert_eq!(s.bands[0], Band::bell(1000.0, 0.0, 0.1));
+        assert_eq!(s.effects["limiter"].params[param.id], param.default);
+        assert_eq!(s.effects["loudness"].params[loudness], effect("loudness").params[0].max);
+    }
+
+    #[test]
+    fn sanitize_leaves_valid_sounds_alone() {
+        for (name, sound) in builtin_presets() {
+            let mut clean = sound.clone();
+            clean.sanitize();
+            assert_eq!(clean, sound, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_imported_sound_can_be_saved_and_read_back() {
+        let s = parse_apo("Preamp: -3 dB\nFilter 1: ON PK Fc 100 Hz Gain NaN dB Q inf\n").unwrap();
+        let mut state = AppState::default();
+        state.output.sound = s.clone();
+        let back: AppState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(back.output.sound, s);
     }
 
     #[test]

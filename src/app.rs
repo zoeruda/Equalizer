@@ -878,6 +878,12 @@ fn effect_page(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &
     page_shell(spec.title, spec.engine, &left, &right, Some(sw.upcast_ref()))
 }
 
+/// A toast showing its text as written. Toasts read markup by default, and a file name
+/// with an `&` in it isn't valid markup, which would leave the toast blank.
+fn plain_toast(text: &str) -> adw::Toast {
+    adw::Toast::builder().title(text).use_markup(false).build()
+}
+
 /// The button that picks, saves and imports presets.
 fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverlay, dir: Direction) -> gtk::MenuButton {
     let button = gtk::MenuButton::new();
@@ -945,8 +951,8 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                     del.connect_clicked(move |_| {
                         if let Some(path) = model::preset_path(&name) {
                             match std::fs::remove_file(path) {
-                                Ok(()) => toasts.add_toast(adw::Toast::new(&format!("Deleted “{name}”"))),
-                                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Couldn't delete: {e}"))),
+                                Ok(()) => toasts.add_toast(plain_toast(&format!("Deleted “{name}”"))),
+                                Err(e) => toasts.add_toast(plain_toast(&format!("Couldn't delete: {e}"))),
                             }
                         }
                         if let Some(f) = this2.borrow().as_ref() {
@@ -998,9 +1004,9 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                         ctx3.state.borrow_mut().chain_mut(dir).preset = name.clone();
                         ctx3.mark_changed();
                         ctx3.refresh(dir);
-                        toasts3.add_toast(adw::Toast::new(&format!("Saved “{name}”")));
+                        toasts3.add_toast(plain_toast(&format!("Saved “{name}”")));
                     }
-                    Err(e) => toasts3.add_toast(adw::Toast::new(&format!("Couldn't save: {e}"))),
+                    Err(e) => toasts3.add_toast(plain_toast(&format!("Couldn't save: {e}"))),
                 }
             });
             dialog.present(Some(&win2));
@@ -1031,9 +1037,9 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                     Ok(sound) => {
                         let n = sound.bands.len();
                         ctx3.load_sound(dir, &name, sound);
-                        toasts3.add_toast(adw::Toast::new(&format!("Imported {n} bands from “{name}”")));
+                        toasts3.add_toast(plain_toast(&format!("Imported {n} bands from “{name}”")));
                     }
-                    Err(e) => toasts3.add_toast(adw::Toast::new(&format!("Couldn't import: {e}"))),
+                    Err(e) => toasts3.add_toast(plain_toast(&format!("Couldn't import: {e}"))),
                 }
             });
         });
@@ -1572,7 +1578,7 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                 portal_autostart(on, move |result| match result {
                     Ok(now_on) => {
                         if on && !now_on {
-                            toasts3.add_toast(adw::Toast::new(
+                            toasts3.add_toast(plain_toast(
                                 "Starting at login isn't allowed. Check this app's background permission in Settings.",
                             ));
                         }
@@ -1580,13 +1586,13 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                         ctx3.state.borrow_mut().autostart = now_on;
                         ctx3.mark_changed();
                     }
-                    Err(e) => toasts3.add_toast(adw::Toast::new(&format!("Couldn't change this: {e}"))),
+                    Err(e) => toasts3.add_toast(plain_toast(&format!("Couldn't change this: {e}"))),
                 });
                 return;
             }
             match set_autostart(on) {
                 Ok(()) => a.set_state(&on.to_variant()),
-                Err(e) => toasts2.add_toast(adw::Toast::new(&format!("Couldn't change this: {e}"))),
+                Err(e) => toasts2.add_toast(plain_toast(&format!("Couldn't change this: {e}"))),
             }
         });
     }
@@ -1603,7 +1609,7 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                         fill();
                     }
                     Event::TurnedOffExternally(dir) => ctx2.set_enabled(dir, false),
-                    Event::Error(message) => toasts2.add_toast(adw::Toast::new(&message)),
+                    Event::Error(message) => toasts2.add_toast(plain_toast(&message)),
                 }
             }
         });

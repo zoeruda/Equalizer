@@ -125,9 +125,16 @@ pub fn find_plugin() -> Option<PathBuf> {
     dirs.into_iter().map(|d| d.join("lsp-plugins-ladspa.so")).find(|p| p.exists())
 }
 
+/// Quotes a string for PipeWire's config format, which reads the same escapes as JSON.
+/// Other programs choose device names, so without this a name could add its own settings.
+fn quoted(s: &str) -> String {
+    serde_json::to_string(s).expect("strings serialize")
+}
+
 /// Builds the arguments for libpipewire-module-filter-chain.
 pub fn module_args(dir: Direction, hw: &str, controls: &BTreeMap<String, f32>, plugin: &Path) -> String {
-    let plugin = plugin.to_string_lossy();
+    let plugin = quoted(&plugin.to_string_lossy());
+    let hw = quoted(hw);
     let mut nodes = String::new();
     let mut links = String::new();
     let chain = dir.chain();
@@ -144,7 +151,7 @@ pub fn module_args(dir: Direction, hw: &str, controls: &BTreeMap<String, f32>, p
         }
         let _ = writeln!(
             nodes,
-            "{{ type = ladspa name = {id} plugin = \"{plugin}\" label = \"http://lsp-plug.in/plugins/ladspa/{label}\" control = {{ {ctl} }} }}"
+            "{{ type = ladspa name = {id} plugin = {plugin} label =\"http://lsp-plug.in/plugins/ladspa/{label}\" control = {{ {ctl} }} }}"
         );
         if let Some(next) = chain.get(i + 1) {
             let _ = writeln!(
@@ -157,12 +164,12 @@ pub fn module_args(dir: Direction, hw: &str, controls: &BTreeMap<String, f32>, p
     let (capture, playback, description) = match dir {
         Direction::Output => (
             format!("node.name = \"{SINK_NAME}\" node.description = \"Equalizer\" media.class = Audio/Sink"),
-            format!("node.name = \"{OUT_STREAM}\" node.description = \"Equalizer output\" node.passive = true target.object = \"{hw}\""),
+            format!("node.name = \"{OUT_STREAM}\" node.description = \"Equalizer output\" node.passive = true target.object = {hw}"),
             "Equalizer",
         ),
         Direction::Mic => (
             format!(
-                "node.name = \"{MIC_STREAM}\" node.description = \"Equalizer microphone input\" node.passive = true target.object = \"{hw}\""
+                "node.name = \"{MIC_STREAM}\" node.description = \"Equalizer microphone input\" node.passive = true target.object = {hw}"
             ),
             format!("node.name = \"{SOURCE_NAME}\" node.description = \"Equalizer Microphone\" media.class = Audio/Source"),
             "Equalizer Microphone",
@@ -328,6 +335,10 @@ fn name_json(v: Option<&str>) -> Option<String> {
     parsed.get("name")?.as_str().map(str::to_owned)
 }
 
+fn default_device_json(name: &str) -> String {
+    serde_json::json!({ "name": name }).to_string()
+}
+
 impl Inner {
     fn devices(&self, dir: usize) -> Vec<Device> {
         let mut v: Vec<Device> = self
@@ -361,12 +372,7 @@ impl Inner {
     fn set_default(&self, dir: usize, name: Option<&str>) {
         if let Some(m) = &self.metadata {
             match name {
-                Some(n) => m.set_property(
-                    0,
-                    DEFAULT_KEYS[dir],
-                    Some("Spa:String:JSON"),
-                    Some(&format!("{{\"name\":\"{n}\"}}")),
-                ),
+                Some(n) => m.set_property(0, DEFAULT_KEYS[dir], Some("Spa:String:JSON"), Some(&default_device_json(n))),
                 None => m.set_property(0, DEFAULT_KEYS[dir], None, None),
             }
         }
@@ -1075,6 +1081,31 @@ mod tests {
         assert!(a.contains("media.class = Audio/Source"));
         assert!(!a.contains("Audio/Sink"));
         assert!(a.contains("inputs = [ \"gate:Input L\""));
+    }
+
+    #[test]
+    fn a_device_name_cannot_add_its_own_settings() {
+        let evil = r#"x" } filter.graph = { nodes = [ ] } playback.props = { a = "b"#;
+        let escaped = r#"target.object = "x\" } filter.graph = { nodes = [ ] } playback.props = { a = \"b""#;
+        for dir in [Direction::Output, Direction::Mic] {
+            let c = plugin_controls(&Sound::flat(), dir);
+            let a = module_args(dir, evil, &c, Path::new("/x/lsp.so"));
+            assert!(a.contains(escaped), "{a}");
+            assert_eq!(a.matches("filter.graph = {").count(), 1 + a.matches(escaped).count());
+        }
+    }
+
+    #[test]
+    fn the_plugin_path_is_escaped_too() {
+        let c = plugin_controls(&Sound::flat(), Direction::Output);
+        let a = module_args(Direction::Output, "hw", &c, Path::new(r#"/x"y\z/lsp.so"#));
+        assert!(a.contains(r#"plugin = "/x\"y\\z/lsp.so""#), "{a}");
+    }
+
+    #[test]
+    fn a_default_device_name_is_escaped() {
+        let name = r#"x","other":"y"#;
+        assert_eq!(name_json(Some(&default_device_json(name))).as_deref(), Some(name));
     }
 
     #[test]
