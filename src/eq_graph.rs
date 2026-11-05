@@ -70,7 +70,7 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
         .build();
     area.set_accessible_role(gtk::AccessibleRole::Application);
     area.update_property(&[gtk::accessible::Property::Label(
-        "Equalizer graph. Arrow keys change the selected band, Tab selects the next band, and Delete removes it.",
+        "Equalizer graph. Arrow keys change the selected band, Tab and Shift+Tab cycle through the bands, Delete removes one, and Escape leaves the graph.",
     )]);
     area.set_size_request(320, 220);
 
@@ -227,18 +227,13 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
                 Key::Down => ctx.edit_band(dir, i, |b| b.gain = (b.gain - db_step).clamp(-GAIN_LIMIT, GAIN_LIMIT)),
                 Key::Right => ctx.edit_band(dir, i, |b| b.freq = (b.freq * f_step).clamp(FREQ_MIN, FREQ_MAX)),
                 Key::Left => ctx.edit_band(dir, i, |b| b.freq = (b.freq / f_step).clamp(FREQ_MIN, FREQ_MAX)),
-                Key::Tab => {
-                    let shift = mods.contains(ModifierType::SHIFT_MASK);
-                    // Leave the graph after the last point so keyboard users can't get stuck.
-                    let next = if shift {
-                        i.checked_sub(1)
-                    } else {
-                        Some(i + 1).filter(|n| *n < count)
-                    };
-                    match next {
-                        Some(n) => ctx.select(dir, n),
-                        None => return glib::Propagation::Proceed,
-                    }
+                // Holding Shift turns Tab into a different key, ISO_Left_Tab.
+                Key::Tab | Key::KP_Tab => ctx.select(dir, next_band(i, count, fine)),
+                Key::ISO_Left_Tab => ctx.select(dir, next_band(i, count, true)),
+                // Tab stays on the graph, so this is how the keyboard gets back out.
+                Key::Escape => {
+                    area2.emit_move_focus(gtk::DirectionType::TabForward);
+                    return glib::Propagation::Stop;
                 }
                 Key::Delete | Key::BackSpace => ctx.remove_band(dir, i),
                 Key::plus | Key::equal | Key::KP_Add => {
@@ -252,6 +247,12 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
     }
     area.add_controller(keys);
     area
+}
+
+/// The band Tab or Shift+Tab selects, wrapping around at either end.
+fn next_band(i: usize, count: usize, back: bool) -> usize {
+    let i = i.min(count - 1);
+    if back { (i + count - 1) % count } else { (i + 1) % count }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -451,6 +452,18 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_cycles_through_the_bands_in_both_directions() {
+        assert_eq!(next_band(0, 3, false), 1);
+        assert_eq!(next_band(2, 3, false), 0, "forward wraps to the first");
+        assert_eq!(next_band(1, 3, true), 0);
+        assert_eq!(next_band(0, 3, true), 2, "back wraps to the last");
+        assert_eq!(next_band(0, 1, false), 0, "a single band stays selected");
+        assert_eq!(next_band(0, 1, true), 0);
+        assert_eq!(next_band(7, 3, false), 0, "a stale selection is treated as the last");
+        assert_eq!(next_band(7, 3, true), 1);
+    }
 
     #[test]
     fn positions_convert_both_ways() {

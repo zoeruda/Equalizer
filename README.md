@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 </p>
 
-> **Early release:** this is version 0.0.1, so expect rough edges and changes between versions.
+> **Early release:** this is version 0.0.2, so expect rough edges and changes between versions.
 
 ![Equalizer's graph with five bands over a live spectrum, with the effect chain in the sidebar](docs/screenshot.png)
 
@@ -108,7 +108,7 @@ On the graph:
 | Change its width | Scroll over the point |
 | Reset its gain | Double-click the point |
 | Type an exact value | Click the number beside a slider |
-| Keyboard | Arrows move a point (Shift for fine steps), Tab selects the next one, Delete removes it, + adds one |
+| Keyboard | Arrows move a point (Shift for fine steps), Tab and Shift+Tab cycle through the points, Delete removes one, + adds one, Escape leaves the graph |
 
 The sidebar lists the effects in the order sound passes through them.
 

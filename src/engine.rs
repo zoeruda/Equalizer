@@ -24,7 +24,13 @@ use crate::model::{Direction, SINK_NAME, SOURCE_NAME, effect};
 const OUT_STREAM: &str = "equalizer_out";
 const MIC_STREAM: &str = "equalizer_mic_in";
 /// How long streams get to leave the virtual output before it's removed anyway.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the output stays after the last stream has left. WirePlumber updates its
+/// own record of links a moment after they go, and pauses any media player that record
+/// still shows on an output when it's removed.
+const DRAIN_SETTLE: Duration = Duration::from_millis(500);
+/// How often a draining output is checked, to notice that one of those times has passed.
+const DRAIN_TICK: Duration = Duration::from_millis(100);
 
 pub enum Cmd {
     Enable {
@@ -177,6 +183,64 @@ struct NodeInfo {
     description: String,
     class: String,
     serial: String,
+    dont_fallback: bool,
+}
+
+struct LinkEnds {
+    input: u32,
+    output: u32,
+}
+
+/// The progress of streams leaving an output that's turning off.
+struct Drain {
+    limit: Instant,
+    left_at: Option<Instant>,
+}
+
+impl Drain {
+    fn new(now: Instant) -> Self {
+        Self {
+            limit: now + DRAIN_TIMEOUT,
+            left_at: None,
+        }
+    }
+
+    /// Whether the output can be removed yet.
+    fn ready(&mut self, now: Instant, in_use: bool) -> bool {
+        if now >= self.limit {
+            return true;
+        }
+        if in_use {
+            self.left_at = None;
+            return false;
+        }
+        now >= *self.left_at.get_or_insert(now) + DRAIN_SETTLE
+    }
+}
+
+/// The default device to hand back, if it still exists. WirePlumber remembers every
+/// default it's been given, including our virtual device. So if it were given a device
+/// that's gone, it could fall back on ours, and streams would have no reason to leave.
+fn hand_back_device(previous: Option<&str>, devices: &[Device]) -> Option<String> {
+    previous.filter(|p| devices.iter().any(|d| d.name == *p)).map(str::to_owned)
+}
+
+/// The streams on a device that should be moved off it. A stream told to have no
+/// fallback is left alone, as it asked not to be sent anywhere else.
+fn streams_to_move(links: &HashMap<u32, LinkEnds>, nodes: &HashMap<u32, NodeInfo>, device: u32) -> Vec<u32> {
+    let mut streams: Vec<u32> = links
+        .values()
+        .filter(|link| link.input == device)
+        .map(|link| link.output)
+        .filter(|id| {
+            nodes
+                .get(id)
+                .is_some_and(|n| n.class.starts_with("Stream/Output") && !n.dont_fallback)
+        })
+        .collect();
+    streams.sort_unstable();
+    streams.dedup();
+    streams
 }
 
 struct Chain {
@@ -186,8 +250,10 @@ struct Chain {
     control: Option<Node>,
     claim_default: bool,
     previous_default: Option<String>,
-    /// Set while turning off, until the streams have left. Holds the time limit.
-    draining: Option<Instant>,
+    /// Set while turning off, until the streams have left.
+    draining: Option<Drain>,
+    /// Streams sent to a real device while turning off, to let go of afterward.
+    pinned: Vec<u32>,
     /// Settings that arrived before the plugin chain finished starting.
     pending: Vec<(String, f32)>,
 }
@@ -202,6 +268,7 @@ impl Chain {
             claim_default: false,
             previous_default: None,
             draining: None,
+            pinned: vec![],
             pending: vec![],
         }
     }
@@ -224,8 +291,8 @@ struct MeterData {
 
 struct Inner {
     nodes: HashMap<u32, NodeInfo>,
-    /// Every link in the graph, as its id and the node it feeds.
-    links: HashMap<u32, u32>,
+    /// Every link in the graph, by id.
+    links: HashMap<u32, LinkEnds>,
     quitting: bool,
     chains: [Chain; 2],
     metadata: Option<Metadata>,
@@ -339,12 +406,43 @@ impl Inner {
         unsafe { pw_sys::pw_impl_module_destroy(chain.module) };
         chain.module = std::ptr::null_mut();
         chain.hw = None;
+        // Only now, as until the device is gone they could go straight back to it.
+        self.unpin_streams(dir);
     }
 
     /// Whether any streams are still playing into this chain's virtual device.
     fn in_use(&self, dir: usize) -> bool {
         self.node_id(own(dir))
-            .is_some_and(|id| self.links.values().any(|input| *input == id))
+            .is_some_and(|id| self.links.values().any(|link| link.input == id))
+    }
+
+    /// Sends the streams on this chain's virtual device to a real one. Handing back the
+    /// default isn't enough, because a stream won't follow it if it has its own target,
+    /// or if WirePlumber doesn't choose a new default until our device is gone.
+    fn pin_streams(&mut self, dir: usize, destination: Option<&str>) {
+        let serial = destination
+            .and_then(|name| self.nodes.values().find(|n| n.name == name))
+            .map(|n| n.serial.as_str())
+            .filter(|serial| !serial.is_empty());
+        let (Some(serial), Some(device), Some(metadata)) = (serial, self.node_id(own(dir)), &self.metadata) else {
+            return;
+        };
+        let streams = streams_to_move(&self.links, &self.nodes, device);
+        for id in &streams {
+            metadata.set_property(*id, "target.object", Some("Spa:Id"), Some(serial));
+        }
+        self.chains[dir].pinned = streams;
+    }
+
+    /// Lets pinned streams follow the default device again. This also clears the target
+    /// that WirePlumber remembers for them, so it won't be used the next time they play.
+    fn unpin_streams(&mut self, dir: usize) {
+        let streams = std::mem::take(&mut self.chains[dir].pinned);
+        if let Some(metadata) = &self.metadata {
+            for id in streams {
+                metadata.set_property(id, "target.object", None, None);
+            }
+        }
     }
 
     /// Hands the default device back and stops the chain. Returns true if the output
@@ -358,13 +456,19 @@ impl Inner {
             return false;
         }
         // Only hand the default back if it's still ours.
-        if self.configured[dir].as_deref() == Some(own(dir)) {
-            let previous = self.chains[dir].previous_default.clone();
-            self.set_default(dir, previous.as_deref());
-        }
+        let default = if self.configured[dir].as_deref() == Some(own(dir)) {
+            let previous = self.chains[dir].previous_default.as_deref();
+            let device = hand_back_device(previous, &self.devices(dir));
+            self.set_default(dir, device.as_deref());
+            device
+        } else {
+            self.configured[dir].clone()
+        };
         self.chains[dir].claim_default = false;
-        if dir == 0 && self.chains[dir].control.is_some() {
-            self.chains[dir].draining = Some(Instant::now() + DRAIN_TIMEOUT);
+        if dir == 0 && self.chains[dir].control.is_some() && self.in_use(dir) {
+            let destination = default.or_else(|| self.chains[dir].hw.clone());
+            self.pin_streams(dir, destination.as_deref());
+            self.chains[dir].draining = Some(Drain::new(Instant::now()));
             true
         } else {
             self.unload(dir);
@@ -580,8 +684,12 @@ fn run(
             let mut s = inner.borrow_mut();
             let mut removed = false;
             for d in 0..2 {
-                let Some(limit) = s.chains[d].draining else { continue };
-                if Instant::now() >= limit || !s.in_use(d) {
+                let in_use = s.in_use(d);
+                let Some(drain) = s.chains[d].draining.as_mut() else { continue };
+                if drain.ready(Instant::now(), in_use) {
+                    if in_use {
+                        eprintln!("equalizer: streams didn't leave the output in time, so it's being removed with them attached");
+                    }
                     s.unload(d);
                     removed = true;
                 }
@@ -631,8 +739,10 @@ fn run(
                 let Some(props) = g.props else { return };
                 match g.type_ {
                     pw::types::ObjectType::Link => {
-                        if let Some(input) = props.get("link.input.node").and_then(|v| v.parse().ok()) {
-                            inner.borrow_mut().links.insert(g.id, input);
+                        let input = props.get("link.input.node").and_then(|v| v.parse().ok());
+                        let output = props.get("link.output.node").and_then(|v| v.parse().ok());
+                        if let (Some(input), Some(output)) = (input, output) {
+                            inner.borrow_mut().links.insert(g.id, LinkEnds { input, output });
                         }
                     }
                     pw::types::ObjectType::Node => {
@@ -645,6 +755,7 @@ fn run(
                                 .to_string(),
                             class: props.get("media.class").unwrap_or_default().to_string(),
                             serial: props.get("object.serial").unwrap_or_default().to_string(),
+                            dont_fallback: matches!(props.get("node.dont-fallback"), Some("true" | "1")),
                             name: name.clone(),
                         };
                         let dir = if name == SINK_NAME {
@@ -795,7 +906,8 @@ fn run(
     mainloop.run();
     send_devices();
 
-    // Wakes the loop when a drain's time limit is up, in case streams never leave.
+    // Wakes the loop while an output drains, as waiting for it to settle or for its time
+    // limit to pass doesn't produce any other event.
     let (wake_tx, wake_rx) = pw::channel::channel::<()>();
     let _wake = {
         let finish = finish_drains.clone();
@@ -804,8 +916,13 @@ fn run(
     let wake_after_limit = move || {
         let tx = wake_tx.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(DRAIN_TIMEOUT);
-            let _ = tx.send(());
+            let end = Instant::now() + DRAIN_TIMEOUT + DRAIN_TICK;
+            while Instant::now() < end {
+                std::thread::sleep(DRAIN_TICK);
+                if tx.send(()).is_err() {
+                    break;
+                }
+            }
         });
     };
 
@@ -837,6 +954,8 @@ fn run(
                         // Ignore the hand-back still on its way, until our claim comes back.
                         s.chains[d].claim_default = true;
                         s.set_default(d, Some(own(d)));
+                        // Now that the default is ours again, they can follow it back.
+                        s.unpin_streams(d);
                         if let Some(node) = &s.chains[d].control {
                             set_params(node, &controls.into_iter().collect::<Vec<_>>());
                         }
@@ -963,5 +1082,80 @@ mod tests {
         assert_eq!(name_json(Some("{\"name\":\"abc\"}")).as_deref(), Some("abc"));
         assert_eq!(name_json(Some("nonsense")), None);
         assert_eq!(name_json(None), None);
+    }
+
+    #[test]
+    fn an_output_waits_for_streams_to_leave_and_then_to_settle() {
+        let start = Instant::now();
+        let mut drain = Drain::new(start);
+        assert!(!drain.ready(start, true), "a stream is still attached");
+
+        let left = start + Duration::from_millis(100);
+        assert!(!drain.ready(left, false), "the stream has only just left");
+        assert!(!drain.ready(left + DRAIN_SETTLE - Duration::from_millis(1), false));
+        assert!(drain.ready(left + DRAIN_SETTLE, false));
+    }
+
+    #[test]
+    fn a_stream_coming_back_restarts_the_settling() {
+        let start = Instant::now();
+        let mut drain = Drain::new(start);
+        assert!(!drain.ready(start, false));
+        let back = start + Duration::from_millis(400);
+        assert!(!drain.ready(back, true));
+        let left = back + Duration::from_millis(50);
+        assert!(!drain.ready(left, false));
+        assert!(!drain.ready(start + DRAIN_SETTLE, false), "the first departure no longer counts");
+        assert!(drain.ready(left + DRAIN_SETTLE, false));
+    }
+
+    #[test]
+    fn an_output_is_removed_at_the_limit_even_with_streams_attached() {
+        let start = Instant::now();
+        let mut drain = Drain::new(start);
+        assert!(!drain.ready(start + DRAIN_TIMEOUT - Duration::from_millis(1), true));
+        assert!(drain.ready(start + DRAIN_TIMEOUT, true));
+    }
+
+    #[test]
+    fn a_device_is_only_handed_back_if_it_still_exists() {
+        let device = |name: &str| Device {
+            name: name.to_string(),
+            description: String::new(),
+        };
+        let devices = [device("speakers"), device("headphones")];
+        assert_eq!(hand_back_device(Some("headphones"), &devices).as_deref(), Some("headphones"));
+        assert_eq!(hand_back_device(Some("unplugged"), &devices), None);
+        assert_eq!(hand_back_device(None, &devices), None);
+    }
+
+    #[test]
+    fn only_ordinary_streams_on_the_device_are_moved() {
+        let node = |class: &str, dont_fallback| NodeInfo {
+            name: String::new(),
+            description: String::new(),
+            class: class.to_string(),
+            serial: String::new(),
+            dont_fallback,
+        };
+        let nodes = HashMap::from([
+            (1, node("Audio/Sink", false)),
+            (2, node("Stream/Output/Audio", false)),
+            (3, node("Stream/Output/Audio", false)),
+            (4, node("Stream/Output/Audio", true)),
+            (5, node("Audio/Source", false)),
+            (6, node("Stream/Output/Audio", false)),
+        ]);
+        let link = |input, output| LinkEnds { input, output };
+        let links = HashMap::from([
+            (10, link(1, 3)),
+            (11, link(1, 2)),
+            (12, link(1, 2)), // A stereo stream has one link for each channel.
+            (13, link(1, 4)),
+            (14, link(1, 5)),
+            (15, link(9, 6)),  // Plays to another device.
+            (16, link(1, 99)), // A node that's already gone.
+        ]);
+        assert_eq!(streams_to_move(&links, &nodes, 1), vec![2, 3]);
     }
 }
