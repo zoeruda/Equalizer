@@ -1,0 +1,25 @@
+[package]
+name = "equalizer"
+version = "0.0.1"
+description = "A clean, simple audio equalizer for GNOME"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/zoeruda/Equalizer"
+
+[dependencies]
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
+async-channel = "2.5.0"
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
+spa_sys = { version = "0.10.1", package = "libspa-sys" }
+pangocairo = "0.22.9"
+pipewire = "0.10.1"
+pw_sys = { version = "0.10.1", package = "pipewire-sys" }
+rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+glib-unix = "0.22.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

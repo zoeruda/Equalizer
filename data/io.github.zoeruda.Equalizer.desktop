@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Equalizer
+Comment=Shape your computer's sound with a clean graphical equalizer
+Exec=equalizer
+Icon=io.github.zoeruda.Equalizer
+Terminal=false
+Categories=GNOME;GTK;Audio;AudioVideo;Mixer;
+Keywords=sound;audio;eq;pipewire;bass;treble;compressor;limiter;
+StartupNotify=true
+SingleMainWindow=true

@@ -1,0 +1,156 @@
+<p align="center">
+  <img src="data/io.github.zoeruda.Equalizer.svg" width="128" height="128" alt="Equalizer icon">
+</p>
+
+<h1 align="center">Equalizer</h1>
+
+<p align="center">
+  A clean, simple equalizer for GNOME, written in Rust with GTK4 and libadwaita.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
+</p>
+
+> **Early release:** this is version 0.0.1, so expect rough edges and changes between versions.
+
+![Equalizer's graph with five bands over a live spectrum, with the effect chain in the sidebar](docs/screenshot.png)
+
+## Features
+
+- **Graphical equalizer:** up to 32 bands, with a live spectrum behind an interactive graph
+- **Full effect chains:** separate chains for your output and your microphone, including auto gain, compressor, limiter, loudness, and noise gate
+- **System-wide:** a virtual device that all ordinary apps pass through
+- **Presets:** save the equalizer and every effect together
+- **Headphone correction:** import AutoEq and Equalizer APO files
+- **Runs in the background:** sound processing can continue after you close the window, and it can start at login
+
+Equalizer uses [PipeWire](https://pipewire.org) for routing and
+[LSP Plugins](https://lsp-plug.in) for the sound processing.
+
+## Install
+
+There are no prebuilt downloads yet, so for now you build Equalizer from source. It
+runs on PipeWire.
+
+### From source
+
+You need Rust 1.92 or newer, for example from [rustup](https://rustup.rs). Then run:
+
+    ./install.sh
+
+This installs into `~/.local` and doesn't need root. On Fedora Silverblue and
+similar systems, it does the building in a `toolbox` container and sets up the other
+build dependencies there.
+
+Otherwise, you also need:
+
+- Development packages for GTK 4.14 or newer, libadwaita 1.5 or newer, and PipeWire
+- clang, which the PipeWire crates use at build time
+
+If LSP Plugins aren't installed, `install.sh` downloads them with `dnf`. On other
+distributions, install `lsp-plugins-ladspa` first.
+
+### Flatpak
+
+To build it, install `org.flatpak.Builder`, `org.gnome.Sdk//51`, and the
+`rust-stable` and `llvm22` SDK extensions (branch `26.08`) from Flathub, then run:
+
+    flatpak run org.flatpak.Builder --user --force-clean --disable-rofiles-fuse --repo=flatpak-repo flatpak-build io.github.zoeruda.Equalizer.yml
+    flatpak build-bundle flatpak-repo Equalizer.flatpak io.github.zoeruda.Equalizer --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+    flatpak install --user ./Equalizer.flatpak
+
+The manifest currently supports x86_64 only, because its library paths are
+hardcoded.
+
+The GNOME runtime leaves out PipeWire's filter-chain module, so the manifest builds
+it, along with LSP Plugins. Its PipeWire version must match the runtime's, so update
+the two together.
+
+Don't run the Flatpak and an `./install.sh` copy at the same time, as they would
+create the same audio devices. While `install.sh`'s launcher exists, it also takes
+the place of the Flatpak's in the app grid.
+
+## Use it
+
+Equalizer adds a virtual device and makes it your default output, so all ordinary
+apps pass through it. Turn **Active** off, or pick another output in system
+settings, and sound goes straight to the device again.
+
+On the graph:
+
+| Action | How |
+| --- | --- |
+| Change a band | Drag its point |
+| Add a band | Double-click an empty spot |
+| Change its width | Scroll over the point |
+| Reset its gain | Double-click the point |
+| Type an exact value | Click the number beside a slider |
+| Keyboard | Arrows move a point (Shift for fine steps), Tab selects the next one, Delete removes it, + adds one |
+
+The sidebar lists the effects in the order sound passes through them.
+
+| Output | Microphone |
+| --- | --- |
+| Auto Gain | Noise Gate |
+| Compressor | Auto Gain |
+| Equalizer (up to 32 bands) | Equalizer (up to 32 bands) |
+| Loudness | Compressor |
+| Limiter | Limiter |
+
+Presets save the equalizer and every effect. You can also import AutoEq and
+Equalizer APO files, which is the usual format for headphone correction.
+
+Closing the window keeps the sound processing running. Open the app again to bring
+the window back, or use **Quit** in the menu (Ctrl+Q) to stop. Both behaviors, and
+starting at login, are in the menu.
+
+Settings live in `~/.config/equalizer/`, or in
+`~/.var/app/io.github.zoeruda.Equalizer/config/equalizer/` for the Flatpak.
+
+## How it works
+
+| File | What it does |
+| --- | --- |
+| `src/engine.rs` | PipeWire thread: loads the plugin chain, creates the virtual device, handles device changes |
+| `src/model.rs` | Settings and presets, the effect table, and how settings become plugin controls |
+| `src/dsp.rs` | Filter response curves and the spectrum analyzer |
+| `src/eq_graph.rs` | The interactive equalizer graph |
+| `src/graphs.rs` | Shared drawing |
+| `src/app.rs` | The window, pages, and the update loop |
+
+The app has no real-time audio code of its own. The audio runs inside PipeWire's
+filter-chain module, and the app sends it settings. New effects are mostly one new
+entry in the `EFFECTS` table in `model.rs`, plus a place in `Direction::chain`.
+
+## Tests
+
+    cargo test
+    DISPLAY=:0 python3 tests/measure.py target/release/equalizer
+
+The second one runs the real app with tones going to a temporary silent device. It
+compares what comes out with what the graph shows, and it needs a display and a
+running PipeWire session.
+
+## Special recognition
+
+Equalizer wouldn't look or work the way it does without two projects:
+
+- **[Easy Effects](https://github.com/wwmm/easyeffects)** showed what a PipeWire
+  effects app built on LSP Plugins can be. If you want a much larger set of effects
+  and controls, it's the app to use.
+- **[Mission Center](https://gitlab.com/mission-center-devs/mission-center)** inspired
+  the look: its colorful, minimal, monitor-style graphs set the direction for
+  Equalizer's interface.
+
+Equalizer isn't affiliated with either project.
+
+Thanks also to [LSP Plugins](https://lsp-plug.in) and
+[PipeWire](https://pipewire.org), which do the actual audio work.
+
+## License
+
+Equalizer is licensed under the [GNU General Public License v3.0 or later](LICENSE).
+
+The Flatpak also bundles [LSP Plugins](https://github.com/lsp-plugins/lsp-plugins)
+(LGPL-3.0) and PipeWire's filter-chain modules (MIT), which keep their own licenses.

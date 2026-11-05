@@ -1,0 +1,83 @@
+id: io.github.zoeruda.Equalizer
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm22
+command: equalizer
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=xdg-run/pipewire-0
+  # The runtime has PipeWire's libraries, but not the modules bundled below.
+  - --env=PIPEWIRE_MODULE_DIR=/app/lib/pipewire-0.3:/usr/lib/x86_64-linux-gnu/pipewire-0.3
+  - --env=SPA_PLUGIN_DIR=/app/lib/spa-0.2:/usr/lib/x86_64-linux-gnu/spa-0.2
+  - --env=LADSPA_PATH=/app/lib/ladspa
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/doc
+modules:
+  # Only the filter-chain pieces the runtime leaves out. The version must match the
+  # runtime's libpipewire, so update it along with runtime-version.
+  - name: pipewire-filter-chain
+    buildsystem: simple
+    build-commands:
+      - >-
+        meson setup _build --prefix=/app --buildtype=release
+        -Dauto_features=disabled -Dsession-managers=[]
+        -Dspa-plugins=enabled -Daudioconvert=enabled
+        -Dexamples=disabled -Dtests=disabled -Ddocs=disabled -Dman=disabled
+      - >-
+        ninja -C _build
+        src/modules/libpipewire-module-filter-chain.so
+        spa/plugins/filter-graph/libspa-filter-graph.so
+        spa/plugins/filter-graph/libspa-filter-graph-plugin-builtin.so
+        spa/plugins/filter-graph/libspa-filter-graph-plugin-ladspa.so
+      - install -Dm755 -t /app/lib/pipewire-0.3 _build/src/modules/libpipewire-module-filter-chain.so
+      - install -Dm755 -t /app/lib/spa-0.2/filter-graph _build/spa/plugins/filter-graph/libspa-filter-graph*.so
+    sources:
+      - type: archive
+        url: https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz
+        sha256: 8181172a1d95131f6af8bbc0b98f90b2a33349b042b84c3ce57dd5d11348cc58
+
+  - name: lsp-plugins
+    buildsystem: simple
+    build-commands:
+      - make config PREFIX=/app FEATURES=ladspa
+      - make -j${FLATPAK_BUILDER_N_JOBS}
+      - make install
+    sources:
+      - type: archive
+        url: https://github.com/lsp-plugins/lsp-plugins/releases/download/1.2.37/lsp-plugins-src-1.2.37.tar.gz
+        sha256: ae7f22b249b41a37db965229ae2ab7237330f83279369f9961277d8bf10d2df4
+
+  - name: equalizer
+    buildsystem: simple
+    build-options:
+      # clang is for bindgen, in the PipeWire crates.
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+      env:
+        CARGO_HOME: /run/build/equalizer/cargo
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+      # Cargo.lock pins the crates, which are downloaded during the build.
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/equalizer /app/bin/equalizer
+      - install -Dm644 data/io.github.zoeruda.Equalizer.desktop -t /app/share/applications
+      - install -Dm644 data/io.github.zoeruda.Equalizer.svg -t /app/share/icons/hicolor/scalable/apps
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .git
+          - target
+          - .flatpak-builder
+          - flatpak-build
+          - flatpak-repo
+          - Equalizer.flatpak

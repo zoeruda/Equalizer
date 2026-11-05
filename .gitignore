@@ -1,0 +1,5 @@
+/target
+/.flatpak-builder
+/flatpak-build
+/flatpak-repo
+/Equalizer.flatpak
