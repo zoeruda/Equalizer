@@ -30,31 +30,57 @@ Equalizer uses [PipeWire](https://pipewire.org) for routing and
 
 ## Install
 
-There are no prebuilt downloads yet, so for now you build Equalizer from source. It
-runs on PipeWire.
+Equalizer runs on PipeWire. To install it,
+[download the latest Flatpak](https://github.com/zoeruda/Equalizer/releases/latest)
+and run:
 
-### From source
+    flatpak install --user ./Equalizer-*-x86_64.flatpak
+
+The Flatpak is for x86_64 only. It gets the GNOME runtime from Flathub, but doesn't
+update automatically, so check the releases page for new versions.
+
+Every release is built from this repository by
+[GitHub Actions](.github/workflows/release.yml), and its release notes show how to
+verify the download.
+
+Don't run the Flatpak and an `./install.sh` copy at the same time, as they would
+create the same audio devices. While `install.sh`'s launcher exists, it also takes
+the place of the Flatpak's in the app grid.
+
+### Build from source
+
+`install.sh` builds Equalizer and installs it into `~/.local`, without needing root.
+It's made for Fedora, so what you need to set up first depends on your system:
+
+| System | What you need first |
+| --- | --- |
+| Fedora, including immutable versions like Silverblue, Kinoite, and Bluefin | Rust and `toolbox`. The script builds in a container and sets up everything else |
+| Other distributions (untested) | Rust and everything in the list below |
+| Other immutable systems | Not supported, so use the Flatpak |
 
 You need Rust 1.92 or newer, for example from [rustup](https://rustup.rs). Then run:
 
     ./install.sh
 
-This installs into `~/.local` and doesn't need root. On Fedora Silverblue and
-similar systems, it does the building in a `toolbox` container and sets up the other
-build dependencies there.
-
-Otherwise, you also need:
+If you aren't using the toolbox, install these first:
 
 - Development packages for GTK 4.14 or newer, libadwaita 1.5 or newer, and PipeWire
-- clang, which the PipeWire crates use at build time
+- clang, gcc, and pkg-config
+- LSP Plugins (`lsp-plugins-ladspa`), unless your system has `dnf`, which the script
+  uses to download them
 
-If LSP Plugins aren't installed, `install.sh` downloads them with `dnf`. On other
-distributions, install `lsp-plugins-ladspa` first.
+The script checks all of this before it starts. If something's missing, your system
+isn't supported, or the build fails, it stops and explains why, and any earlier install
+stays as it was.
 
-### Flatpak
+### Build the Flatpak yourself
 
-To build it, install `org.flatpak.Builder`, `org.gnome.Sdk//51`, and the
-`rust-stable` and `llvm22` SDK extensions (branch `26.08`) from Flathub, then run:
+First, add Flathub if you don't have it, and install the build tools:
+
+    flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+    flatpak install --user flathub org.flatpak.Builder org.gnome.Platform//51 org.gnome.Sdk//51 org.freedesktop.Sdk.Extension.rust-stable//26.08 org.freedesktop.Sdk.Extension.llvm22//26.08
+
+Then build and install the app:
 
     flatpak run org.flatpak.Builder --user --force-clean --disable-rofiles-fuse --repo=flatpak-repo flatpak-build io.github.zoeruda.Equalizer.yml
     flatpak build-bundle flatpak-repo Equalizer.flatpak io.github.zoeruda.Equalizer --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -66,10 +92,6 @@ hardcoded.
 The GNOME runtime leaves out PipeWire's filter-chain module, so the manifest builds
 it, along with LSP Plugins. Its PipeWire version must match the runtime's, so update
 the two together.
-
-Don't run the Flatpak and an `./install.sh` copy at the same time, as they would
-create the same audio devices. While `install.sh`'s launcher exists, it also takes
-the place of the Flatpak's in the app grid.
 
 ## Use it
 
