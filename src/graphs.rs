@@ -4,6 +4,7 @@ use gtk::pango;
 use std::collections::VecDeque;
 use std::f64::consts::PI;
 
+use crate::dsp;
 use crate::theme::{self, Rgb};
 
 pub const HISTORY_FLOOR: f64 = -60.0;
@@ -79,18 +80,61 @@ pub fn text(cr: &Context, s: &str, x: f64, y: f64, size: f64, color: Rgb, alpha:
     (tw as f64, th as f64)
 }
 
-/// A scrolling level trace, newest on the right, in dBFS.
-pub fn trace(cr: &Context, w: f64, h: f64, data: &VecDeque<f64>, capacity: usize, color: Rgb, fill: bool, line_alpha: f64) {
+/// Softens jitter in dB values for display. It blurs `sigma` points each way, averaging
+/// power rather than dB so that quiet moments don't drag loud peaks down with them.
+pub fn smooth_levels(data: impl IntoIterator<Item = f64>, sigma: f64) -> Vec<f64> {
+    let power: Vec<f64> = data.into_iter().map(|db| 10f64.powf(db / 10.0)).collect();
+    let radius = (sigma * 3.0).ceil() as isize;
+    let weights: Vec<f64> = (-radius..=radius).map(|d| (-0.5 * (d as f64 / sigma).powi(2)).exp()).collect();
+    (0..power.len() as isize)
+        .map(|i| {
+            // Near the ends the blur only has one side to work with.
+            let (mut sum, mut total) = (0.0, 0.0);
+            for (d, weight) in (-radius..=radius).zip(&weights) {
+                if let Some(p) = usize::try_from(i + d).ok().and_then(|j| power.get(j)) {
+                    sum += p * weight;
+                    total += weight;
+                }
+            }
+            10.0 * (sum / total).log10()
+        })
+        .collect()
+}
+
+/// Continues the path with a smooth, wave-like curve through evenly spaced points.
+pub fn curve_through(cr: &Context, x0: f64, step: f64, ys: &[f64]) {
+    let Some(first) = ys.first() else { return };
+    cr.line_to(x0, *first);
+    let slope_at = |i: usize| {
+        let before = if i > 0 { ys[i] - ys[i - 1] } else { 0.0 };
+        let after = if i + 1 < ys.len() { ys[i + 1] - ys[i] } else { 0.0 };
+        dsp::curve_slope(before, after)
+    };
+    for i in 1..ys.len() {
+        let (x1, x2) = (x0 + (i - 1) as f64 * step, x0 + i as f64 * step);
+        cr.curve_to(
+            x1 + step / 3.0,
+            ys[i - 1] + slope_at(i - 1) / 3.0,
+            x2 - step / 3.0,
+            ys[i] - slope_at(i) / 3.0,
+            x2,
+            ys[i],
+        );
+    }
+}
+
+/// A scrolling level trace, newest on the right, in dBFS. `blur_px` is set in pixels, so
+/// a graph keeps its look when the window is resized.
+pub fn trace(cr: &Context, w: f64, h: f64, data: &VecDeque<f64>, capacity: usize, color: Rgb, fill: bool, line_alpha: f64, blur_px: f64) {
     if data.len() < 2 {
         return;
     }
     let step = w / (capacity.max(2) - 1) as f64;
     let start = w - (data.len() - 1) as f64 * step;
     let y_of = |db: f64| h - ((db - HISTORY_FLOOR) / -HISTORY_FLOOR).clamp(0.0, 1.0) * (h - 3.0);
-    cr.move_to(start, y_of(data[0]));
-    for (i, v) in data.iter().enumerate().skip(1) {
-        cr.line_to(start + i as f64 * step, y_of(*v));
-    }
+    let levels = smooth_levels(data.iter().copied(), blur_px / step);
+    let ys: Vec<f64> = levels.iter().map(|db| y_of(*db)).collect();
+    curve_through(cr, start, step, &ys);
     if fill {
         let path = cr.copy_path();
         cr.line_to(w, h);
@@ -237,6 +281,42 @@ mod tests {
         text(&cr, "0 dB", 6.0, 50.0, 11.0, theme::DIM, 0.85, pango::Alignment::Left);
         // An arc would otherwise draw a line from the label to wherever the arc starts.
         assert!(!cr.has_current_point().expect("cairo state"));
+    }
+
+    #[test]
+    fn smoothing_leaves_a_steady_level_alone() {
+        for db in smooth_levels([-20.0; 30], 1.2) {
+            assert!((db + 20.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn smoothing_softens_fast_jitter() {
+        let jitter: Vec<f64> = (0..200).map(|i| if i % 2 == 0 { -20.0 } else { -26.0 }).collect();
+        let soft = smooth_levels(jitter, 1.2);
+        for pair in soft[20..180].windows(2) {
+            assert!((pair[1] - pair[0]).abs() < 0.1, "still jagged: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn smoothing_keeps_a_loud_peak_prominent() {
+        let mut spike = vec![-60.0; 101];
+        spike[50] = -20.0;
+        let soft = smooth_levels(spike, 1.2);
+        assert!(soft[50] > -25.0, "peak sank to {}", soft[50]);
+        assert!(soft[50] <= -20.0 + 1e-9, "peak rose to {}", soft[50]);
+    }
+
+    #[test]
+    fn curves_pass_through_every_point_and_stay_close_to_them() {
+        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 100, 100).expect("surface");
+        let cr = Context::new(&surface).expect("context");
+        curve_through(&cr, 0.0, 10.0, &[50.0, 10.0, 90.0, 90.0, 20.0]);
+        assert_eq!(cr.current_point().expect("cairo state"), (40.0, 20.0));
+        let (_, top, _, bottom) = cr.path_extents().expect("cairo state");
+        assert!((5.0..=10.0).contains(&top), "curve reached up to {top}");
+        assert!((90.0..=105.0).contains(&bottom), "curve reached down to {bottom}");
     }
 
     #[test]

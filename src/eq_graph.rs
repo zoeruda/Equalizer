@@ -16,6 +16,8 @@ const HANDLE_RADIUS: f64 = 7.0;
 const HIT_RADIUS: f64 = 15.0;
 const AXIS_H: f64 = 22.0;
 const SNAP_DB: f64 = 0.35;
+/// How far the live spectrum is blurred for display, in columns.
+const SPECTRUM_BLUR: f64 = 0.8;
 /// A fixed scale, so a point never jumps out from under the pointer mid-drag.
 const RANGE: f64 = GAIN_LIMIT;
 
@@ -327,12 +329,18 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
     {
         let rt = ctx.rt[dir as usize].borrow();
         let y_sp = |db: f64| h - ((db - SPECTRUM_FLOOR) / -SPECTRUM_FLOOR).clamp(0.0, 1.0) * h * 0.74;
+        let step = w / SPECTRUM_COLUMNS as f64;
+        let curve = |cols: &[f64]| {
+            let ys: Vec<f64> = graphs::smooth_levels(cols.iter().copied(), SPECTRUM_BLUR)
+                .iter()
+                .map(|db| y_sp(*db))
+                .collect();
+            graphs::curve_through(cr, step / 2.0, step, &ys);
+        };
         let cols = &rt.spectrum_post.columns;
         if cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
             cr.move_to(0.0, h);
-            for (i, db) in cols.iter().enumerate() {
-                cr.line_to((i as f64 + 0.5) / SPECTRUM_COLUMNS as f64 * w, y_sp(*db));
-            }
+            curve(cols);
             cr.line_to(w, h);
             cr.close_path();
             graphs::seta(cr, color, 0.30);
@@ -340,10 +348,7 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
         }
         let cols = &rt.spectrum_pre.columns;
         if chain.enabled && cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
-            for (i, db) in cols.iter().enumerate() {
-                let (x, y) = ((i as f64 + 0.5) / SPECTRUM_COLUMNS as f64 * w, y_sp(*db));
-                if i == 0 { cr.move_to(x, y) } else { cr.line_to(x, y) }
-            }
+            curve(cols);
             graphs::seta(cr, theme::TEXT, 0.20);
             cr.set_line_width(1.0);
             let _ = cr.stroke();

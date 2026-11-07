@@ -19,6 +19,10 @@ use crate::theme::{self, Rgb};
 pub const APP_ID: &str = "io.github.zoeruda.Equalizer";
 const HISTORY_LEN: usize = 900; // one minute at the 15 Hz history rate
 const SPARK_LEN: usize = 150;
+/// How far each level graph is blurred. The small ones pack in about two samples per pixel,
+/// so they take far less, or their jitter disappears.
+const LEVEL_BLUR_PX: f64 = 1.0;
+const SPARK_BLUR_PX: f64 = 0.4;
 const DIRS: [Direction; 2] = [Direction::Output, Direction::Mic];
 
 /// Live measurements for one chain.
@@ -357,8 +361,8 @@ fn level_graph(ctx: &Rc<Ctx>, dir: Direction, color: Rgb, live: &LiveRef) -> gtk
         graphs::panel_begin(cr, w, h);
         graphs::grid(cr, w, h, 20, 4, color);
         let rt = ctx.rt[dir as usize].borrow();
-        graphs::trace(cr, w, h, &rt.history_post, HISTORY_LEN, color, true, 1.0);
-        graphs::trace(cr, w, h, &rt.history_pre, HISTORY_LEN, theme::TEXT, false, 0.35);
+        graphs::trace(cr, w, h, &rt.history_post, HISTORY_LEN, color, true, 1.0, LEVEL_BLUR_PX);
+        graphs::trace(cr, w, h, &rt.history_pre, HISTORY_LEN, theme::TEXT, false, 0.35, LEVEL_BLUR_PX);
         drop(rt);
         graphs::panel_end(cr, w, h, color);
     });
@@ -1082,7 +1086,7 @@ fn tile(ctx: &Rc<Ctx>, dir: Direction, id: &'static str, live: &LiveRef) -> gtk:
             let recent: VecDeque<f64> = rt.history_post.iter().rev().take(SPARK_LEN).rev().copied().collect();
             drop(rt);
             if on {
-                graphs::trace(cr, w, h, &recent, SPARK_LEN, c, true, 1.0);
+                graphs::trace(cr, w, h, &recent, SPARK_LEN, c, true, 1.0, SPARK_BLUR_PX);
             }
             graphs::panel_end(cr, w, h, c);
         });
@@ -1745,6 +1749,18 @@ fn tick_meters(ctx: &Ctx, dir: Direction) {
 mod tests {
     use super::*;
     use crate::model::EFFECTS;
+
+    #[test]
+    fn small_graphs_keep_their_jitter() {
+        // A 6 dB wobble lasting six samples, on a small graph at its usual width.
+        let jitter: Vec<f64> = (0..SPARK_LEN).map(|i| if i % 6 < 3 { -20.0 } else { -26.0 }).collect();
+        let step = 72.0 / (SPARK_LEN - 1) as f64;
+        let soft = graphs::smooth_levels(jitter, SPARK_BLUR_PX / step);
+        let middle = &soft[30..120];
+        let highest = middle.iter().copied().fold(f64::MIN, f64::max);
+        let lowest = middle.iter().copied().fold(f64::MAX, f64::min);
+        assert!(highest - lowest > 3.0, "only {} dB of wobble left", highest - lowest);
+    }
 
     #[test]
     fn typed_values_are_understood() {

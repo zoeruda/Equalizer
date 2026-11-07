@@ -1,0 +1,71 @@
+# Maintainer: zoeruda <https://github.com/zoeruda>
+
+# This lives in its own folder because makepkg works in a "src" folder beside this file,
+# and in the repository root that would be the app's source code.
+
+pkgname=equalizer
+pkgver=0.0.4
+pkgrel=1
+pkgdesc='A clean, simple audio equalizer for GNOME'
+arch=('x86_64')
+url='https://github.com/zoeruda/Equalizer'
+license=('GPL-3.0-or-later')
+depends=(
+  'cairo'
+  'glib2'
+  'glibc'
+  'gtk4'
+  'hicolor-icon-theme'
+  'libadwaita'
+  'libgcc'
+  'libpipewire'
+  'lsp-plugins-ladspa'
+  'pango'
+  'pipewire'
+  # Has the filter-graph plugin that lets PipeWire load LSP Plugins. The app builds and
+  # opens without it, but can't process sound.
+  'pipewire-audio'
+)
+makedepends=(
+  'cargo'
+  # For bindgen, in the PipeWire crates.
+  'clang'
+  'git'
+)
+# The checksum can't be recorded here, because this file is part of the source it would
+# cover. A copy published outside this repository should fill it in with updpkgsums.
+source=("git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+# With makepkg's LTO, the C wrapper in the libspa crate can't be linked into the app.
+# This doesn't affect the Rust LTO set in Cargo.toml.
+# Cargo.toml also strips the symbols, so a debug package would have nothing useful in it.
+options=('!lto' '!debug')
+
+_id=io.github.zoeruda.Equalizer
+
+prepare() {
+  cd Equalizer
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd Equalizer
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd Equalizer
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen
+}
+
+package() {
+  cd Equalizer
+  install -Dm755 target/release/equalizer -t "$pkgdir/usr/bin"
+  install -Dm644 "data/$_id.desktop" -t "$pkgdir/usr/share/applications"
+  install -Dm644 "data/$_id.svg" -t "$pkgdir/usr/share/icons/hicolor/scalable/apps"
+}

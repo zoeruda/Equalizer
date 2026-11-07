@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 </p>
 
-> **Early release:** this is version 0.0.3, so expect rough edges and changes between versions.
+> **Early release:** this is version 0.0.4, so expect rough edges and changes between versions.
 
 ![Equalizer's graph with five bands over a live spectrum, with the effect chain in the sidebar](docs/screenshot.png)
 
@@ -58,8 +58,18 @@ The sandbox still limits the rest. The Flatpak has no network access, and apart 
 its own settings, it can only read files you choose to import. It also has access to
 your display and graphics hardware to draw its window.
 
-A copy from `./install.sh` has no sandbox, so it runs with all the access your user
-account has.
+A copy from `./install.sh` or the Arch package has no sandbox, so it runs with all the
+access your user account has.
+
+### Arch Linux
+
+From a copy of this repository, build and install the package with:
+
+    cd packaging/arch
+    makepkg -si
+
+This downloads the release that the `PKGBUILD` names, not the copy you're in. As with
+the other versions, don't run it alongside another copy of Equalizer.
 
 ### Build from source
 

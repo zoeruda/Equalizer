@@ -110,12 +110,27 @@ impl Analyzer {
     }
 }
 
+/// How steep a smooth curve should be at a point, given the change on either side of it.
+/// Carrying the slope through each point makes the line flow like a wave, rather than
+/// leveling off into terraces, at the cost of sometimes going slightly past a sharp peak.
+pub fn curve_slope(before: f64, after: f64) -> f64 {
+    (before + after) / 2.0
+}
+
+/// Reads between `y1` and `y2`, with `t` from 0 to 1, along a curve that also takes in their neighbors.
+fn curve_between(y0: f64, y1: f64, y2: f64, y3: f64, t: f64) -> f64 {
+    let (m1, m2) = (curve_slope(y1 - y0, y2 - y1), curve_slope(y2 - y1, y3 - y2));
+    let (t2, t3) = (t * t, t * t * t);
+    (2.0 * t3 - 3.0 * t2 + 1.0) * y1 + (t3 - 2.0 * t2 + t) * m1 + (3.0 * t2 - 2.0 * t3) * y2 + (t3 - t2) * m2
+}
+
 /// Turns the newest samples into log-spaced columns of dB values.
 pub struct Spectrum {
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     input: Vec<f32>,
     buf: Vec<Complex<f32>>,
+    bins: Vec<f64>,
     pub columns: Vec<f64>,
 }
 
@@ -134,6 +149,7 @@ impl Spectrum {
             window,
             input: vec![0.0; FFT_SIZE],
             buf: vec![Complex::default(); FFT_SIZE],
+            bins: vec![SPECTRUM_FLOOR; FFT_SIZE / 2 + 1],
             columns: vec![SPECTRUM_FLOOR; SPECTRUM_COLUMNS],
         }
     }
@@ -149,16 +165,32 @@ impl Spectrum {
         let ratio = (FREQ_MAX / FREQ_MIN).powf(1.0 / SPECTRUM_COLUMNS as f64);
         // A Hann window halves the amplitude, hence 4 rather than 2.
         let norm = 4.0 / FFT_SIZE as f64;
+        for (level, bin) in self.bins.iter_mut().zip(&self.buf) {
+            *level = to_db(bin.norm() as f64 * norm).max(SPECTRUM_FLOOR);
+        }
+        let last = FFT_SIZE / 2;
         for c in 0..SPECTRUM_COLUMNS {
             let lo = FREQ_MIN * ratio.powi(c as i32);
             let hi = lo * ratio;
-            let a = ((lo / bin_hz) as usize).clamp(1, FFT_SIZE / 2 - 1);
-            let b = ((hi / bin_hz).ceil() as usize).clamp(a + 1, FFT_SIZE / 2);
-            let mut m = 0f64;
-            for bin in &self.buf[a..b] {
-                m = m.max(bin.norm() as f64 * norm);
+            // Low columns are narrower than a bin, and reading the nearest one would turn
+            // them into stairs, so each reads the curve between bins at its own center.
+            let center = ((lo * hi).sqrt() / bin_hz).clamp(1.0, (last - 1) as f64);
+            let a = center as usize;
+            let mut db = curve_between(
+                self.bins[(a - 1).max(1)],
+                self.bins[a],
+                self.bins[a + 1],
+                self.bins[(a + 2).min(last)],
+                center - a as f64,
+            );
+            // Higher columns span several bins. The loudest one sets the level, so peaks stay true.
+            let first = ((lo / bin_hz).ceil() as usize).max(1);
+            let end = ((hi / bin_hz).floor() as usize).min(last);
+            if first <= end {
+                for bin in &self.bins[first..=end] {
+                    db = db.max(*bin);
+                }
             }
-            let db = to_db(m).max(SPECTRUM_FLOOR);
             // Rise instantly and fall gently, like a monitor trace.
             let held = self.columns[c] - 1.8;
             self.columns[c] = db.max(held).max(SPECTRUM_FLOOR);
@@ -249,6 +281,46 @@ mod tests {
         let f = FREQ_MIN * ratio.powi(col as i32);
         assert!(f > 900.0 && f < 1100.0, "peak at {f} Hz");
         assert!(db.abs() < 1.0, "peak level {db} dB");
+    }
+
+    #[test]
+    fn low_frequencies_change_gradually_rather_than_in_steps() {
+        let mut a = Analyzer::new();
+        let samples: Vec<f32> = (0..FFT_SIZE)
+            .flat_map(|i| {
+                let v = (2.0 * PI * 80.0 * i as f64 / 48_000.0).sin() as f32;
+                [v, v]
+            })
+            .collect();
+        a.feed(&samples);
+        let mut s = Spectrum::new();
+        s.update(&a);
+        let ratio = (FREQ_MAX / FREQ_MIN).powf(1.0 / SPECTRUM_COLUMNS as f64);
+        let col_at = |f: f64| ((f / FREQ_MIN).ln() / ratio.ln()) as usize;
+        // Around the tone, where several columns share each bin, every column moves.
+        for pair in s.columns[col_at(50.0)..col_at(110.0)].windows(2) {
+            assert!((pair[1] - pair[0]).abs() > 1e-6, "flat step at {pair:?}");
+        }
+    }
+
+    #[test]
+    fn the_curve_between_points_touches_them_and_stays_close() {
+        // Touches the points it starts and ends on.
+        assert!((curve_between(0.0, 2.0, 5.0, 6.0, 0.0) - 2.0).abs() < 1e-9);
+        assert!((curve_between(0.0, 2.0, 5.0, 6.0, 1.0) - 5.0).abs() < 1e-9);
+        // Even beside a sharp peak it only strays a little past its two points.
+        for i in 0..=20 {
+            let v = curve_between(0.0, 10.0, 0.0, 0.0, i as f64 / 20.0);
+            assert!((-1.5..=11.5).contains(&v), "{v} strays too far");
+        }
+    }
+
+    #[test]
+    fn a_curve_keeps_its_slope_through_a_point() {
+        assert_eq!(curve_slope(2.0, 4.0), 3.0);
+        // Level only at a symmetric peak, so uneven peaks stay pointed rather than flat.
+        assert_eq!(curve_slope(5.0, -5.0), 0.0);
+        assert_eq!(curve_slope(6.0, -2.0), 2.0);
     }
 
     #[test]

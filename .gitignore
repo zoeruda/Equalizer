@@ -3,3 +3,5 @@
 /flatpak-build
 /flatpak-repo
 /Equalizer.flatpak
+/packaging/arch/*
+!/packaging/arch/PKGBUILD
