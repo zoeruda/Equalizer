@@ -446,6 +446,15 @@ impl Sound {
         }
     }
 
+    /// Puts the equalizer back to how the Flat preset has it: its bands, preamp and
+    /// balance. The other effects, and whether the equalizer is on, stay as they are.
+    pub fn reset_eq(&mut self) {
+        let flat = Self::flat();
+        self.bands = flat.bands;
+        self.preamp = flat.preamp;
+        self.balance = flat.balance;
+    }
+
     pub fn param(&self, effect: &str, id: &str) -> f64 {
         let spec = self::effect(effect).params.iter().find(|p| p.id == id).expect("unknown param");
         self.effects
@@ -825,6 +834,22 @@ mod tests {
         assert_eq!(s.bands[0], Band::bell(1000.0, 0.0, 0.1));
         assert_eq!(s.effects["limiter"].params[param.id], param.default);
         assert_eq!(s.effects["loudness"].params[loudness], effect("loudness").params[0].max);
+    }
+
+    #[test]
+    fn resetting_the_equalizer_leaves_the_other_effects_alone() {
+        let mut s = builtin_presets().into_iter().find(|(n, _)| *n == "Late Night").unwrap().1;
+        s.preamp = -4.0;
+        s.balance = 30.0;
+        s.eq_enabled = false;
+        s.effects.get_mut("autogain").unwrap().params.insert("target".into(), -30.0);
+        let effects = s.effects.clone();
+        s.reset_eq();
+        let flat = Sound::flat();
+        assert_eq!(s.bands, flat.bands);
+        assert_eq!((s.preamp, s.balance), (0.0, 0.0));
+        assert_eq!(s.effects, effects);
+        assert!(!s.eq_enabled, "the on/off switch is for comparing, not a setting to reset");
     }
 
     #[test]

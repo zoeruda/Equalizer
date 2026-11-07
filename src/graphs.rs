@@ -123,8 +123,29 @@ pub fn curve_through(cr: &Context, x0: f64, step: f64, ys: &[f64]) {
     }
 }
 
+/// The stretches of `data` with no gap (NaN) in them, as index ranges.
+pub fn runs(data: &VecDeque<f64>) -> Vec<std::ops::Range<usize>> {
+    let mut out = vec![];
+    let mut start = None;
+    for (i, v) in data.iter().enumerate() {
+        match (v.is_nan(), start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                out.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push(s..data.len());
+    }
+    out
+}
+
 /// A scrolling level trace, newest on the right, in dBFS. `blur_px` is set in pixels, so
-/// a graph keeps its look when the window is resized.
+/// a graph keeps its look when the window is resized. NaN marks a time when nothing was
+/// measured, which is left empty.
 pub fn trace(cr: &Context, w: f64, h: f64, data: &VecDeque<f64>, capacity: usize, color: Rgb, fill: bool, line_alpha: f64, blur_px: f64) {
     if data.len() < 2 {
         return;
@@ -132,23 +153,36 @@ pub fn trace(cr: &Context, w: f64, h: f64, data: &VecDeque<f64>, capacity: usize
     let step = w / (capacity.max(2) - 1) as f64;
     let start = w - (data.len() - 1) as f64 * step;
     let y_of = |db: f64| h - ((db - HISTORY_FLOOR) / -HISTORY_FLOOR).clamp(0.0, 1.0) * (h - 3.0);
-    let levels = smooth_levels(data.iter().copied(), blur_px / step);
-    let ys: Vec<f64> = levels.iter().map(|db| y_of(*db)).collect();
-    curve_through(cr, start, step, &ys);
-    if fill {
-        let path = cr.copy_path();
-        cr.line_to(w, h);
-        cr.line_to(start, h);
-        cr.close_path();
-        seta(cr, color, 0.34);
-        let _ = cr.fill();
-        if let Ok(path) = path {
-            cr.append_path(&path);
+    for run in runs(data).into_iter().filter(|r| r.len() >= 2) {
+        let (x0, x1) = (start + run.start as f64 * step, start + (run.end - 1) as f64 * step);
+        let levels = smooth_levels(data.range(run).copied(), blur_px / step);
+        let ys: Vec<f64> = levels.iter().map(|db| y_of(*db)).collect();
+        // A filled stretch is outlined down to the bottom where it starts and stops,
+        // so it reads as a closed shape. Not at the panel's own edges.
+        let (open_left, open_right) = (fill && x0 > 0.5, fill && x1 < w - 0.5);
+        cr.new_path();
+        if open_left {
+            cr.move_to(x0, h);
         }
+        curve_through(cr, x0, step, &ys);
+        if open_right {
+            cr.line_to(x1, h);
+        }
+        if fill {
+            let path = cr.copy_path();
+            cr.line_to(x1, h);
+            cr.line_to(x0, h);
+            cr.close_path();
+            seta(cr, color, 0.34);
+            let _ = cr.fill();
+            if let Ok(path) = path {
+                cr.append_path(&path);
+            }
+        }
+        seta(cr, color, line_alpha);
+        cr.set_line_width(1.4);
+        let _ = cr.stroke();
     }
-    seta(cr, color, line_alpha);
-    cr.set_line_width(1.4);
-    let _ = cr.stroke();
 }
 
 /// Input vs output plot for compressors and limiters. Values are in dB.
@@ -259,6 +293,17 @@ pub fn fmt_level(d: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trace_is_split_at_its_gaps() {
+        let d = |v: &[f64]| v.iter().copied().collect::<VecDeque<f64>>();
+        let n = f64::NAN;
+        assert_eq!(runs(&d(&[1.0, 2.0, n, n, 3.0, 4.0, 5.0])), vec![0..2, 4..7]);
+        assert_eq!(runs(&d(&[n, 1.0, n])), vec![1..2]);
+        assert_eq!(runs(&d(&[1.0, 2.0])), vec![0..2]);
+        assert!(runs(&d(&[n, n])).is_empty());
+        assert!(runs(&d(&[])).is_empty());
+    }
 
     #[test]
     fn compression_leaves_quiet_sound_alone_and_reduces_loud_sound() {

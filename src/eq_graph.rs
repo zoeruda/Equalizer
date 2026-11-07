@@ -338,7 +338,7 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
             graphs::curve_through(cr, step / 2.0, step, &ys);
         };
         let cols = &rt.spectrum_post.columns;
-        if cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
+        if chain.enabled && cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
             cr.move_to(0.0, h);
             curve(cols);
             cr.line_to(w, h);
@@ -347,7 +347,7 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
             let _ = cr.fill();
         }
         let cols = &rt.spectrum_pre.columns;
-        if chain.enabled && cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
+        if cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
             curve(cols);
             graphs::seta(cr, theme::TEXT, 0.20);
             cr.set_line_width(1.0);

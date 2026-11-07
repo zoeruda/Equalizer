@@ -228,6 +228,16 @@ with App(lambda s: effect(s, "autogain", target=-20.0, maxgain=24.0)):
         fails.append("autogain boost")
         print("  FAIL auto gain should raise a quiet tone")
 
+print("Volume comes after the effects")
+# 50% on the cubic volume curve is -18 dB. Applied before the chain, Auto Gain and the
+# compressor would take it for quieter sound and win most of it back.
+for name in ["autogain", "compressor"]:
+    with App(lambda s: effect(s, name)):
+        full = measure(1000, db=-14.0, seconds=3.0)
+        run("pactl", "set-sink-volume", "equalizer_sink", "50%")
+        half = measure(1000, db=-14.0, seconds=3.0)
+        check(f"{name} on: 50% volume lowers the output by 18 dB", half - full, 60 * math.log10(0.5))
+
 print("Default device")
 before = run("pw-metadata", "-n", "default", "0", "default.configured.audio.sink")
 with App(lambda s: None):

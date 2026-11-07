@@ -72,6 +72,9 @@ pub struct Analyzer {
     pos: usize,
     pub rate: u32,
     peak: f32,
+    /// Applied to each channel as it's fed. It undoes a volume that was applied to the
+    /// sound being measured, so that only the effects show.
+    pub gain: [f32; 2],
 }
 
 impl Analyzer {
@@ -81,14 +84,17 @@ impl Analyzer {
             pos: 0,
             rate: 48_000,
             peak: 0.0,
+            gain: [1.0; 2],
         }
     }
 
     /// `samples` is interleaved stereo.
     pub fn feed(&mut self, samples: &[f32]) {
+        let [gl, gr] = self.gain;
         for frame in samples.as_chunks::<2>().0 {
-            self.peak = self.peak.max(frame[0].abs()).max(frame[1].abs());
-            self.ring[self.pos] = (frame[0] + frame[1]) * 0.5;
+            let (l, r) = (frame[0] * gl, frame[1] * gr);
+            self.peak = self.peak.max(l.abs()).max(r.abs());
+            self.ring[self.pos] = (l + r) * 0.5;
             self.pos = (self.pos + 1) % FFT_SIZE;
         }
     }
@@ -207,6 +213,19 @@ impl Spectrum {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_analyzer_applies_its_gain_to_each_channel() {
+        let mut a = Analyzer::new();
+        a.gain = [8.0, 2.0];
+        a.feed(&[0.1, 0.0, 0.0, 0.25]);
+        assert_eq!(a.take_peak(), 0.8);
+        let mut out = vec![0.0; FFT_SIZE];
+        a.snapshot(&mut out);
+        assert_eq!(&out[FFT_SIZE - 2..], &[0.4, 0.25]);
+        a.clear();
+        assert_eq!(a.gain, [8.0, 2.0], "clearing the samples keeps the gain");
+    }
 
     fn band(kind: FilterKind, freq: f64, gain: f64, q: f64) -> Band {
         Band {

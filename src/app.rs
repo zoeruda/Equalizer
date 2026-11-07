@@ -19,6 +19,9 @@ use crate::theme::{self, Rgb};
 pub const APP_ID: &str = "io.github.zoeruda.Equalizer";
 const HISTORY_LEN: usize = 900; // one minute at the 15 Hz history rate
 const SPARK_LEN: usize = 150;
+/// How long the after-processing graph waits for its meter after the chain turns on,
+/// in frames. Past this, silence is shown as silence.
+const AFTER_GRACE: u32 = 30;
 /// How far each level graph is blurred. The small ones pack in about two samples per pixel,
 /// so they take far less, or their jitter disappears.
 const LEVEL_BLUR_PX: f64 = 1.0;
@@ -37,6 +40,31 @@ pub struct Rt {
     frame: u32,
     smooth_pre: f64,
     smooth_post: f64,
+    after: AfterStart,
+}
+
+/// Decides when the after-processing graph starts again once the chain turns on. Its
+/// meter takes a moment to connect, and recording before then would start each stretch
+/// with a drop to silence that never happened.
+#[derive(Default)]
+struct AfterStart {
+    started: bool,
+    waited: u32,
+}
+
+impl AfterStart {
+    /// Whether this frame's after-processing level should be recorded.
+    fn step(&mut self, processing: bool, has_sound: bool) -> bool {
+        if !processing {
+            *self = Self::default();
+            return false;
+        }
+        if !self.started {
+            self.waited += 1;
+            self.started = has_sound || self.waited >= AFTER_GRACE;
+        }
+        self.started
+    }
 }
 
 impl Rt {
@@ -52,6 +80,7 @@ impl Rt {
             frame: 0,
             smooth_pre: HISTORY_FLOOR,
             smooth_post: HISTORY_FLOOR,
+            after: AfterStart::default(),
         }
     }
 }
@@ -382,7 +411,8 @@ fn plot_graph(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &L
         let sound = &s.chain(dir).sound;
         let on = sound.is_on(spec.id);
         let color = if on { spec.color } else { theme::DIM };
-        let input = ctx.rt[dir as usize].borrow().smooth_pre;
+        // With the chain off, the effect isn't acting on the sound at all.
+        let input = s.chain(dir).enabled.then(|| ctx.rt[dir as usize].borrow().smooth_pre);
         let curve: Box<dyn Fn(f64) -> f64> = if !on {
             Box::new(|d| d)
         } else if spec.id == "compressor" {
@@ -401,7 +431,7 @@ fn plot_graph(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &L
             Box::new(move |d| if d < t { d + r } else { d })
         };
         let range = if spec.id == "gate" { 90.0 } else { 60.0 };
-        graphs::transfer(cr, w, h, color, &*curve, range, Some(input));
+        graphs::transfer(cr, w, h, color, &*curve, range, input);
         drop(s);
         graphs::text(
             cr,
@@ -479,9 +509,9 @@ fn level_readouts(ctx: &Rc<Ctx>, dir: Direction, right: &gtk::Box, live: &LiveRe
     let ctx = ctx.clone();
     live.borrow_mut().updaters.push(Box::new(move || {
         let rt = ctx.rt[dir as usize].borrow();
-        let has_pre = ctx.state.borrow().chain(dir).enabled;
-        input.set_text(&if has_pre { fmt_level(rt.smooth_pre) } else { "—".into() });
-        output.set_text(&fmt_level(rt.smooth_post));
+        let processing = ctx.state.borrow().chain(dir).enabled;
+        input.set_text(&fmt_level(rt.smooth_pre));
+        output.set_text(&if processing { fmt_level(rt.smooth_post) } else { "—".into() });
     }));
 }
 
@@ -523,7 +553,12 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
         let ctx2 = ctx.clone();
         live.borrow_mut().updaters.push(Box::new(move || {
             let rt = ctx2.rt[dir as usize].borrow();
-            let p = rt.smooth_post;
+            // What reaches the device: with the chain off, that's the unprocessed sound.
+            let p = if ctx2.state.borrow().chain(dir).enabled {
+                rt.smooth_post
+            } else {
+                rt.smooth_pre
+            };
             peak.set_text(&fmt_level(p));
             headroom.set_text(&if p <= HISTORY_FLOOR {
                 "—".into()
@@ -717,6 +752,21 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
     };
     right.append(&pre_row);
     right.append(&bal_row);
+    // Presets replace every effect, so this is the only way to reset just the equalizer.
+    let reset = gtk::Button::with_label("Reset to Defaults");
+    reset.add_css_class("flat");
+    reset.set_margin_top(4);
+    reset.set_tooltip_text(Some(
+        "Bands, preamp and balance as in the Flat preset. Other effects stay as they are.",
+    ));
+    {
+        let ctx2 = ctx.clone();
+        reset.connect_clicked(move |_| {
+            ctx2.selected[dir as usize].set(0);
+            ctx2.edit_sound(dir, Sound::reset_eq);
+        });
+    }
+    right.append(&reset);
     ctx.listen(move |d| {
         if d == dir {
             pre_sync();
@@ -1708,6 +1758,7 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
 }
 
 fn tick_meters(ctx: &Ctx, dir: Direction) {
+    let processing = ctx.state.borrow().chain(dir).enabled;
     let mut rt = ctx.rt[dir as usize].borrow_mut();
     let rt = &mut *rt;
     let read = |a: &std::sync::Mutex<dsp::Analyzer>, s: &mut Spectrum| -> (f64, f64) {
@@ -1729,13 +1780,20 @@ fn tick_meters(ctx: &Ctx, dir: Direction) {
     rt.rate = rate;
     rt.peak_pre = pre.max(HISTORY_FLOOR);
     rt.peak_post = post.max(HISTORY_FLOOR);
+    let recording_after = rt.after.step(processing, rt.peak_post > HISTORY_FLOOR);
+    if !recording_after {
+        // So a new stretch doesn't open with what the last one ended on.
+        rt.peak_post = HISTORY_FLOOR;
+        rt.smooth_post = HISTORY_FLOOR;
+    }
     // Numbers jump up to a new peak and ease back down, so they stay readable.
     rt.smooth_pre = rt.peak_pre.max(rt.smooth_pre - 0.5);
     rt.smooth_post = rt.peak_post.max(rt.smooth_post - 0.5);
     rt.frame = rt.frame.wrapping_add(1);
     if rt.frame.is_multiple_of(2) {
         rt.history_pre.push_back(rt.smooth_pre);
-        rt.history_post.push_back(rt.smooth_post);
+        // With nothing being processed, there's no "after" to show: a gap, not silence.
+        rt.history_post.push_back(if recording_after { rt.smooth_post } else { f64::NAN });
         if rt.history_pre.len() > HISTORY_LEN {
             rt.history_pre.pop_front();
         }
@@ -1749,6 +1807,25 @@ fn tick_meters(ctx: &Ctx, dir: Direction) {
 mod tests {
     use super::*;
     use crate::model::EFFECTS;
+
+    #[test]
+    fn the_after_graph_waits_for_its_meter_once_the_chain_turns_on() {
+        let mut a = AfterStart::default();
+        assert!(!a.step(false, true), "nothing is recorded with the chain off");
+        assert!(!a.step(true, false), "the meter hasn't delivered anything yet");
+        assert!(a.step(true, true));
+        assert!(a.step(true, false), "once started, silence is recorded as silence");
+        assert!(!a.step(false, false));
+        assert!(!a.step(true, false), "turning back on waits again");
+    }
+
+    #[test]
+    fn silence_is_shown_after_a_while_even_without_sound() {
+        let mut a = AfterStart::default();
+        let recorded = (0..AFTER_GRACE).filter(|_| a.step(true, false)).count();
+        assert_eq!(recorded, 1);
+        assert!(a.step(true, false));
+    }
 
     #[test]
     fn small_graphs_keep_their_jitter() {
