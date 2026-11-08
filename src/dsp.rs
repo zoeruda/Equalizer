@@ -160,14 +160,25 @@ impl Spectrum {
         }
     }
 
+    #[cfg(test)]
     pub fn update(&mut self, analyzer: &Analyzer) {
+        self.capture(analyzer);
+        self.analyze(analyzer.rate);
+    }
+
+    /// Copies the newest samples. This is the only part that needs the analyzer, which
+    /// the audio thread shares, so the slower `analyze` can run after letting go of it.
+    pub fn capture(&mut self, analyzer: &Analyzer) {
         analyzer.snapshot(&mut self.input);
+    }
+
+    /// Turns the captured samples into columns.
+    pub fn analyze(&mut self, rate: u32) {
         for i in 0..FFT_SIZE {
             self.buf[i] = Complex::new(self.input[i] * self.window[i], 0.0);
         }
         self.fft.process(&mut self.buf);
-        let rate = analyzer.rate as f64;
-        let bin_hz = rate / FFT_SIZE as f64;
+        let bin_hz = rate as f64 / FFT_SIZE as f64;
         let ratio = (FREQ_MAX / FREQ_MIN).powf(1.0 / SPECTRUM_COLUMNS as f64);
         // A Hann window halves the amplitude, hence 4 rather than 2.
         let norm = 4.0 / FFT_SIZE as f64;

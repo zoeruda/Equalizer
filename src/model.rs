@@ -510,6 +510,13 @@ pub fn plugin_controls(sound: &Sound, dir: Direction) -> BTreeMap<String, f32> {
             m.insert("eq:Bypass".into(), if sound.eq_enabled { 0.0 } else { 1.0 });
             m.insert("eq:Input gain (G)".into(), db_to_g(sound.preamp));
             m.insert("eq:Output balance (%)".into(), sound.balance as f32);
+            // The plugin's own spectrum analyzer, for its own window. Nothing here can
+            // read it, so it would only use CPU.
+            for side in ["Left", "Right"] {
+                for point in ["Input", "Output", "Return"] {
+                    m.insert(format!("eq:{point} FFT graph enable {side}"), 0.0);
+                }
+            }
             for i in 0..MAX_BANDS {
                 let band = sound.bands.get(i).filter(|b| b.enabled);
                 let kind = band.map_or(0.0, |b| b.kind.lsp_type());
@@ -879,6 +886,10 @@ mod tests {
         assert_eq!(m["eq:Filter type 1"], 0.0);
         assert!((m["eq:Gain 0 (G)"] - 10.0).abs() < 1e-4);
         assert_eq!(m["eq:Filter mode 0"], 6.0);
+        for point in ["Input", "Output", "Return"] {
+            assert_eq!(m[&format!("eq:{point} FFT graph enable Left")], 0.0);
+            assert_eq!(m[&format!("eq:{point} FFT graph enable Right")], 0.0);
+        }
         assert_eq!(m["compressor:Bypass"], 1.0);
         assert_eq!(m["limiter:Bypass"], 0.0);
         assert!(!m.contains_key("gate:Bypass"), "the output chain has no gate");

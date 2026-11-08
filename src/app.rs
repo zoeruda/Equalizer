@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::dsp::{self, Spectrum};
+use crate::dsp::{self, SPECTRUM_FLOOR, Spectrum};
 use crate::engine::{self, Cmd, Device, Event};
 use crate::eq_graph;
 use crate::graphs::{self, HISTORY_FLOOR, fmt_db, fmt_freq, fmt_level};
@@ -41,6 +41,8 @@ pub struct Rt {
     smooth_pre: f64,
     smooth_post: f64,
     after: AfterStart,
+    /// Nothing the graphs show is moving: see `at_rest`.
+    still: bool,
 }
 
 /// Decides when the after-processing graph starts again once the chain turns on. Its
@@ -81,6 +83,7 @@ impl Rt {
             smooth_pre: HISTORY_FLOOR,
             smooth_post: HISTORY_FLOOR,
             after: AfterStart::default(),
+            still: false,
         }
     }
 }
@@ -375,8 +378,15 @@ fn spec_row(grid: &gtk::Grid, row: i32, key: &str, value: &str) -> gtk::Label {
 /// Everything redrawn on each frame.
 #[derive(Default)]
 struct Live {
-    areas: Vec<gtk::DrawingArea>,
+    /// Each with whether it currently shows anything that moves.
+    areas: Vec<(gtk::DrawingArea, Box<dyn Fn() -> bool>)>,
     updaters: Vec<Box<dyn Fn()>>,
+}
+
+impl Live {
+    fn add(&mut self, area: &gtk::DrawingArea) {
+        self.areas.push((area.clone(), Box::new(|| true)));
+    }
 }
 
 type LiveRef = Rc<RefCell<Live>>;
@@ -395,7 +405,7 @@ fn level_graph(ctx: &Rc<Ctx>, dir: Direction, color: Rgb, live: &LiveRef) -> gtk
         drop(rt);
         graphs::panel_end(cr, w, h, color);
     });
-    live.borrow_mut().areas.push(area.clone());
+    live.borrow_mut().add(&area);
     area
 }
 
@@ -446,7 +456,7 @@ fn plot_graph(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &L
         graphs::text(cr, "↑ Output level", 8.0, 6.0, 11.0, theme::DIM, 0.9, pango::Alignment::Left);
         graphs::panel_end(cr, w, h, color);
     });
-    live.borrow_mut().areas.push(area.clone());
+    live.borrow_mut().add(&area);
     area
 }
 
@@ -523,7 +533,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
     );
     left.append(&cap);
     let graph = eq_graph::build(ctx.clone(), dir);
-    live.borrow_mut().areas.push(graph.clone());
+    live.borrow_mut().add(&graph);
     left.append(&graph);
     let (cap2, _) = caption_row("Output level over 1 minute", "Filled: after processing · Line: before");
     cap2.set_margin_top(8);
@@ -1125,10 +1135,7 @@ fn tile(ctx: &Rc<Ctx>, dir: Direction, id: &'static str, live: &LiveRef) -> gtk:
         let ctx = ctx.clone();
         spark.set_draw_func(move |_, cr, w, h| {
             let (w, h) = (w as f64, h as f64);
-            let s = ctx.state.borrow();
-            let chain = s.chain(dir);
-            let on = chain.enabled && chain.sound.is_on(id);
-            drop(s);
+            let on = tile_live(&ctx, dir, id);
             let c = if on { color } else { theme::DIM };
             graphs::panel_begin(cr, w, h);
             graphs::grid(cr, w, h, 6, 3, c);
@@ -1141,7 +1148,14 @@ fn tile(ctx: &Rc<Ctx>, dir: Direction, id: &'static str, live: &LiveRef) -> gtk:
             graphs::panel_end(cr, w, h, c);
         });
     }
-    live.borrow_mut().areas.push(spark.clone());
+    // A tile whose effect is off shows a still panel, so it's only redrawn when the
+    // settings change. Each redraw costs far more than drawing the graph itself.
+    {
+        let ctx = ctx.clone();
+        live.borrow_mut()
+            .areas
+            .push((spark.clone(), Box::new(move || tile_live(&ctx, dir, id))));
+    }
     let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
     texts.set_valign(gtk::Align::Center);
     let name = label(title, "tile-name");
@@ -1187,9 +1201,17 @@ fn tile(ctx: &Rc<Ctx>, dir: Direction, id: &'static str, live: &LiveRef) -> gtk:
     ctx.listen(move |d| {
         if d == dir {
             update();
+            spark.queue_draw();
         }
     });
     row
+}
+
+/// Whether a sidebar tile shows a live graph: its effect is on, in a chain that's on.
+fn tile_live(ctx: &Ctx, dir: Direction, id: &str) -> bool {
+    let s = ctx.state.borrow();
+    let chain = s.chain(dir);
+    chain.enabled && chain.sound.is_on(id)
 }
 
 fn chain_page(
@@ -1679,9 +1701,10 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
     // The steady heartbeat: meters, redraws, settings, saving.
     {
         let (ctx2, win2, live2, dir_of) = (ctx.clone(), win.clone(), live.clone(), current_dir.clone());
-        let mut metering: Option<Direction> = None;
-        let mut sent_meter_cmd = false;
-        glib::timeout_add_local(Duration::from_millis(33), move || {
+        let metering: Cell<Option<Direction>> = Cell::new(None);
+        let sent_meter_cmd = Cell::new(false);
+        let was_still = Cell::new(false);
+        let beat: Rc<dyn Fn() -> bool> = Rc::new(move || {
             if ctx2.dirty.replace(false) {
                 for dir in DIRS {
                     if ctx2.state.borrow().chain(dir).enabled {
@@ -1698,9 +1721,9 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                     .and_downcast::<gdk::Toplevel>()
                     .is_some_and(|t| t.state().intersects(gdk::ToplevelState::MINIMIZED | gdk::ToplevelState::SUSPENDED));
             let want = showing.then(&dir_of);
-            if want != metering || !sent_meter_cmd {
-                metering = want;
-                sent_meter_cmd = true;
+            if want != metering.get() || !sent_meter_cmd.get() {
+                metering.set(want);
+                sent_meter_cmd.set(true);
                 ctx2.engine.send(Cmd::Meters(want));
             }
             if let Some(dir) = want {
@@ -1709,14 +1732,21 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                 for u in &l.updaters {
                     u();
                 }
-                for a in &l.areas {
-                    if a.is_mapped() {
-                        a.queue_draw();
+                // Once a frame has shown everything at rest, the next would look the same.
+                // Settings changes redraw by themselves.
+                let still = ctx2.rt[dir as usize].borrow().still;
+                let shown_at_rest = was_still.replace(still);
+                if !(still && shown_at_rest) {
+                    for (a, moving) in &l.areas {
+                        if a.is_mapped() && moving() {
+                            a.queue_draw();
+                        }
                     }
                 }
             }
-            glib::ControlFlow::Continue
+            showing
         });
+        heartbeat(beat, true);
     }
 
     {
@@ -1742,6 +1772,19 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
         });
     }
 
+    // The graphs also show settings, which the heartbeat stops redrawing while the
+    // sound is at rest.
+    {
+        let live = live.clone();
+        ctx.listen(move |_| {
+            if let Ok(l) = live.try_borrow() {
+                for (a, _) in &l.areas {
+                    a.queue_draw();
+                }
+            }
+        });
+    }
+
     // Fill in every control from the saved state.
     for dir in DIRS {
         ctx.refresh(dir);
@@ -1757,23 +1800,43 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
     }
 }
 
+/// Runs `beat` for each frame while the window shows. Otherwise there's nothing to draw,
+/// so it only runs a few times a second, to keep up with saving and to notice the window
+/// coming back. `beat` says whether the window is showing.
+fn heartbeat(beat: Rc<dyn Fn() -> bool>, showing: bool) {
+    let interval = Duration::from_millis(if showing { 33 } else { 250 });
+    glib::timeout_add_local(interval, move || {
+        let now = beat();
+        if now == showing {
+            return glib::ControlFlow::Continue;
+        }
+        heartbeat(beat.clone(), now);
+        glib::ControlFlow::Break
+    });
+}
+
 fn tick_meters(ctx: &Ctx, dir: Direction) {
     let processing = ctx.state.borrow().chain(dir).enabled;
     let mut rt = ctx.rt[dir as usize].borrow_mut();
     let rt = &mut *rt;
     let read = |a: &std::sync::Mutex<dsp::Analyzer>, s: &mut Spectrum| -> (f64, f64) {
-        match a.lock() {
+        let (peak, rate) = match a.lock() {
             Ok(mut g) => {
                 let peak = g.take_peak() as f64;
                 if peak > 0.0 {
-                    s.update(&g);
-                } else {
-                    s.decay();
+                    s.capture(&g);
                 }
-                (dsp::to_db(peak), g.rate as f64)
+                (peak, g.rate)
             }
-            Err(_) => (HISTORY_FLOOR, 48_000.0),
+            Err(_) => return (HISTORY_FLOOR, 48_000.0),
+        };
+        // After letting go, so the audio thread never waits for the FFT.
+        if peak > 0.0 {
+            s.analyze(rate);
+        } else {
+            s.decay();
         }
+        (dsp::to_db(peak), rate as f64)
     };
     let (pre, _) = read(&ctx.engine.pre, &mut rt.spectrum_pre);
     let (post, rate) = read(&ctx.engine.post, &mut rt.spectrum_post);
@@ -1801,12 +1864,36 @@ fn tick_meters(ctx: &Ctx, dir: Direction) {
             rt.history_post.pop_front();
         }
     }
+    rt.still = at_rest(rt);
+}
+
+/// Whether the graphs would look the same on the next frame: no spectrum is showing, and
+/// the last minute of levels is all one value (silence, or a gap), so scrolling it
+/// changes nothing.
+fn at_rest(rt: &Rt) -> bool {
+    let quiet = |s: &Spectrum| s.columns.iter().all(|c| *c <= SPECTRUM_FLOOR + 0.5);
+    let flat = |h: &VecDeque<f64>| h.len() >= HISTORY_LEN && h.iter().all(|v| v.to_bits() == h[0].to_bits());
+    quiet(&rt.spectrum_pre) && quiet(&rt.spectrum_post) && flat(&rt.history_pre) && flat(&rt.history_post)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::EFFECTS;
+
+    #[test]
+    fn the_graphs_rest_only_once_a_whole_minute_shows_nothing_moving() {
+        let mut rt = Rt::new();
+        assert!(!at_rest(&rt), "the history is still filling in");
+        rt.history_pre = std::iter::repeat_n(HISTORY_FLOOR, HISTORY_LEN).collect();
+        rt.history_post = std::iter::repeat_n(f64::NAN, HISTORY_LEN).collect();
+        assert!(at_rest(&rt), "silence before, a gap after");
+        rt.history_post[3] = -20.0;
+        assert!(!at_rest(&rt), "sound from earlier in the minute is still scrolling by");
+        rt.history_post[3] = f64::NAN;
+        rt.spectrum_pre.columns[10] = -40.0;
+        assert!(!at_rest(&rt), "the spectrum is fading out");
+    }
 
     #[test]
     fn the_after_graph_waits_for_its_meter_once_the_chain_turns_on() {

@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 </p>
 
-> **Early release:** this is version 0.0.4, so expect rough edges and changes between versions.
+> **Early release:** this is version 0.0.5, so expect rough edges and changes between versions.
 
 ![Equalizer's graph with five bands over a live spectrum, with the effect chain in the sidebar](docs/screenshot.png)
 

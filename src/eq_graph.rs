@@ -97,12 +97,15 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
         "Equalizer graph. Arrow keys change the selected band, Tab and Shift+Tab cycle through the bands, Delete removes one, and Escape leaves the graph.",
     )]);
     area.set_size_request(320, 220);
+    // The border shows focus.
+    area.connect_has_focus_notify(|a| a.queue_draw());
 
     let hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let dragging: Rc<RefCell<Option<Drag>>> = Rc::new(RefCell::new(None));
 
     {
         let (ctx, hover, dragging) = (ctx.clone(), hover.clone(), dragging.clone());
+        let cache = RefCell::new(FrontCache::default());
         area.set_draw_func(move |a, cr, w, h| {
             draw(
                 &ctx,
@@ -113,6 +116,8 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
                 hover.get(),
                 dragging.borrow().is_some(),
                 a.has_focus(),
+                draw_scale(a),
+                &cache,
             );
         });
     }
@@ -280,7 +285,51 @@ fn next_band(i: usize, count: usize, back: bool) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64, hover: Option<usize>, dragging: bool, focused: bool) {
+/// Everything that's drawn over the spectrum. It only changes with the settings or the
+/// pointer, so it's kept as an image and each frame only redraws what moves.
+#[derive(Clone, PartialEq)]
+struct FrontKey {
+    w: f64,
+    full_h: f64,
+    scale: f64,
+    bands: Vec<Band>,
+    selected: usize,
+    hover: Option<usize>,
+    dragging: bool,
+    focused: bool,
+    active: bool,
+    eq_enabled: bool,
+    preamp: f64,
+    rate: f64,
+}
+
+#[derive(Default)]
+struct FrontCache {
+    key: Option<FrontKey>,
+    image: Option<gtk::cairo::ImageSurface>,
+}
+
+/// The scale the window is drawn at, which can be fractional, so the cached image stays sharp.
+fn draw_scale(area: &gtk::DrawingArea) -> f64 {
+    area.native()
+        .and_then(|n| n.surface())
+        .map_or(area.scale_factor() as f64, |s| s.scale())
+        .max(1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw(
+    ctx: &Ctx,
+    dir: Direction,
+    cr: &gtk::cairo::Context,
+    w: f64,
+    full_h: f64,
+    hover: Option<usize>,
+    dragging: bool,
+    focused: bool,
+    scale: f64,
+    cache: &RefCell<FrontCache>,
+) {
     let h = (full_h - AXIS_H).max(40.0);
     let state = ctx.state.borrow();
     let chain = state.chain(dir);
@@ -312,7 +361,6 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
         cr.move_to(x, 0.0);
         cr.line_to(x, h);
     }
-    let labels = [12.0, -12.0];
     for db in [-18.0, -12.0, -6.0, 6.0, 12.0, 18.0] {
         let y = y_of(db, h, range).round() + 0.5;
         cr.move_to(0.0, y);
@@ -355,6 +403,74 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
         }
     }
 
+    graphs::panel_trim(cr, w, h);
+
+    let front = FrontKey {
+        w,
+        full_h,
+        scale,
+        bands: bands.clone(),
+        selected,
+        hover,
+        dragging,
+        focused,
+        active,
+        eq_enabled: sound.eq_enabled,
+        preamp: sound.preamp,
+        rate,
+    };
+    let mut cache = cache.borrow_mut();
+    if cache.key.as_ref() != Some(&front) {
+        cache.image = render_front(&front);
+        cache.key = Some(front.clone());
+    }
+    match &cache.image {
+        Some(image) => {
+            let _ = cr.save();
+            cr.scale(1.0 / scale, 1.0 / scale);
+            let _ = cr.set_source_surface(image, 0.0, 0.0);
+            let _ = cr.paint();
+            let _ = cr.restore();
+        }
+        None => draw_front(cr, &front),
+    }
+}
+
+fn render_front(k: &FrontKey) -> Option<gtk::cairo::ImageSurface> {
+    let (pw, ph) = ((k.w * k.scale).ceil() as i32, (k.full_h * k.scale).ceil() as i32);
+    let image = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, pw.max(1), ph.max(1)).ok()?;
+    let cr = gtk::cairo::Context::new(&image).ok()?;
+    cr.scale(k.scale, k.scale);
+    draw_front(&cr, k);
+    drop(cr);
+    Some(image)
+}
+
+fn draw_front(cr: &gtk::cairo::Context, k: &FrontKey) {
+    let FrontKey {
+        w,
+        full_h,
+        ref bands,
+        selected,
+        hover,
+        dragging,
+        focused,
+        active,
+        eq_enabled,
+        preamp,
+        rate,
+        ..
+    } = *k;
+    let h = (full_h - AXIS_H).max(40.0);
+    let range = RANGE;
+    let color = theme::EQ_BLUE;
+    let zero = y_of(0.0, h, range).round() + 0.5;
+    let labels = [12.0, -12.0];
+
+    let _ = cr.save();
+    cr.rectangle(0.0, 0.0, w, h);
+    cr.clip();
+
     let n = (w / 2.0).max(32.0) as usize;
     let f_at = |i: usize| f_of(i as f64 / n as f64 * w, w);
 
@@ -381,12 +497,8 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
     let curve_color = if active { theme::TEXT } else { theme::DIM };
     for s in 0..=n {
         let f = f_at(s);
-        let db = if sound.eq_enabled {
-            dsp::total_response_db(bands, f, rate)
-        } else {
-            0.0
-        };
-        let y = y_of((db + sound.preamp).clamp(-range * 1.2, range * 1.2), h, range);
+        let db = if eq_enabled { dsp::total_response_db(bands, f, rate) } else { 0.0 };
+        let y = y_of((db + preamp).clamp(-range * 1.2, range * 1.2), h, range);
         if s == 0 {
             cr.move_to(x_of(f, w), y)
         } else {
@@ -459,7 +571,8 @@ fn draw(ctx: &Ctx, dir: Direction, cr: &gtk::cairo::Context, w: f64, full_h: f64
         graphs::text(cr, &label, bx + box_w / 2.0, by + 4.5, 12.0, theme::TEXT, 1.0, Alignment::Center);
     }
 
-    graphs::panel_end(cr, w, h, if focused { theme::TEXT } else { color });
+    graphs::panel_trim(cr, w, h);
+    graphs::panel_border(cr, w, h, if focused { theme::TEXT } else { color });
 
     // Frequency axis.
     for f in [20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0, 20_000.0] {

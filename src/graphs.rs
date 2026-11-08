@@ -27,16 +27,37 @@ pub fn seta(cr: &Context, c: Rgb, a: f64) {
 }
 
 /// Fills the panel and clips to it. Pair with `panel_end`.
+///
+/// The clip is a plain rectangle. Clipping to the rounded shape would make cairo mask
+/// every fill and stroke inside the panel, which took several times longer to draw.
+/// `panel_end` trims the corners instead.
 pub fn panel_begin(cr: &Context, w: f64, h: f64) {
     let _ = cr.save();
     rounded(cr, 0.5, 0.5, w - 1.0, h - 1.0, 6.0);
     set(cr, theme::GRAPH_BG);
-    let _ = cr.fill_preserve();
+    let _ = cr.fill();
+    cr.rectangle(0.0, 0.0, w, h);
     cr.clip();
 }
 
 pub fn panel_end(cr: &Context, w: f64, h: f64, color: Rgb) {
+    panel_trim(cr, w, h);
+    panel_border(cr, w, h, color);
+}
+
+/// Ends the panel's clip and clears anything drawn past its rounded corners.
+pub fn panel_trim(cr: &Context, w: f64, h: f64) {
     let _ = cr.restore();
+    let _ = cr.save();
+    cr.rectangle(0.0, 0.0, w, h);
+    rounded(cr, 0.5, 0.5, w - 1.0, h - 1.0, 6.0);
+    cr.set_fill_rule(gtk::cairo::FillRule::EvenOdd);
+    cr.set_operator(gtk::cairo::Operator::Clear);
+    let _ = cr.fill();
+    let _ = cr.restore();
+}
+
+pub fn panel_border(cr: &Context, w: f64, h: f64, color: Rgb) {
     rounded(cr, 0.5, 0.5, w - 1.0, h - 1.0, 6.0);
     set(cr, color);
     cr.set_line_width(1.2);
@@ -293,6 +314,29 @@ pub fn fmt_level(d: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_keeps_its_rounded_corners_whatever_is_drawn_inside() {
+        let mut surf = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 100, 50).unwrap();
+        {
+            let cr = Context::new(&surf).unwrap();
+            panel_begin(&cr, 100.0, 50.0);
+            cr.set_source_rgb(1.0, 0.0, 0.0);
+            let _ = cr.paint();
+            panel_end(&cr, 100.0, 50.0, (0.0, 0.0, 1.0));
+        }
+        let stride = surf.stride() as usize;
+        let data = surf.data().unwrap();
+        let px = |x: usize, y: usize| &data[y * stride + x * 4..y * stride + x * 4 + 4];
+        for (x, y) in [(0, 0), (99, 0), (0, 49), (99, 49)] {
+            assert_eq!(px(x, y)[3], 0, "corner pixel {x},{y} should stay clear");
+        }
+        // Next to the corner only the border's soft edge may show, none of the red.
+        for (x, y) in [(1, 1), (98, 1), (1, 48), (98, 48)] {
+            assert_eq!(px(x, y)[2], 0, "no red at {x},{y}");
+        }
+        assert_eq!(px(50, 25), &[0, 0, 255, 255], "the inside keeps what was drawn (BGRA)");
+    }
 
     #[test]
     fn a_trace_is_split_at_its_gaps() {
