@@ -2,7 +2,7 @@
 //! settings translate into LSP plugin controls.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const MAX_BANDS: usize = 32;
 pub const GAIN_LIMIT: f64 = 24.0;
@@ -633,8 +633,48 @@ pub fn save_state(s: &AppState) -> std::io::Result<()> {
     std::fs::rename(tmp, dir.join("state.json"))
 }
 
-pub fn presets_dir() -> PathBuf {
-    config_dir().join("presets")
+/// Where one tab's own presets are kept. The Output uses the folder that every
+/// version before 0.0.6 used for both tabs.
+pub fn presets_dir(dir: Direction) -> PathBuf {
+    presets_dir_in(&config_dir(), dir)
+}
+
+fn presets_dir_in(config: &Path, dir: Direction) -> PathBuf {
+    let base = config.join("presets");
+    match dir {
+        Direction::Output => base,
+        Direction::Mic => base.join("microphone"),
+    }
+}
+
+/// Gives the Microphone its own preset folder, the first time 0.0.6 or later runs.
+/// It starts as a copy of the shared folder, so presets saved before then stay on
+/// both tabs. The folder existing marks this as done, even when it's empty.
+pub fn split_presets() -> std::io::Result<()> {
+    split_presets_in(&config_dir())
+}
+
+fn split_presets_in(config: &Path) -> std::io::Result<()> {
+    let mic = presets_dir_in(config, Direction::Mic);
+    if mic.exists() {
+        return Ok(());
+    }
+    // Copied into a temporary folder first, so a copy cut short is started over
+    // next time instead of counting as done.
+    let tmp = presets_dir_in(config, Direction::Output).join(".microphone.tmp");
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    std::fs::create_dir_all(&tmp)?;
+    if let Ok(entries) = std::fs::read_dir(presets_dir_in(config, Direction::Output)) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "json") {
+                std::fs::copy(&path, tmp.join(e.file_name()))?;
+            }
+        }
+    }
+    std::fs::rename(tmp, mic)
 }
 
 fn with_bands(bands: &[(FilterKind, f64, f64, f64)]) -> Sound {
@@ -652,11 +692,29 @@ fn with_bands(bands: &[(FilterKind, f64, f64, f64)]) -> Sound {
     s
 }
 
-pub fn builtin_presets() -> Vec<(&'static str, Sound)> {
+/// Turns an effect on, with some of its settings changed from their defaults.
+fn turn_on(mut s: Sound, effect: &str, params: &[(&str, f64)]) -> Sound {
+    let state = s.effects.get_mut(effect).expect("unknown effect");
+    state.enabled = true;
+    for (id, v) in params {
+        state.params.insert(id.to_string(), *v);
+    }
+    s
+}
+
+/// The presets that come with the app, for one tab. The two chains have different
+/// effects, so each tab has its own. Both lists start with Flat, the default.
+pub fn builtin_presets(dir: Direction) -> Vec<(&'static str, Sound)> {
+    match dir {
+        Direction::Output => output_presets(),
+        Direction::Mic => mic_presets(),
+    }
+}
+
+fn output_presets() -> Vec<(&'static str, Sound)> {
     use FilterKind::*;
-    let mut late = with_bands(&[(LowShelf, 90.0, 2.0, 0.7), (Bell, 3000.0, 1.5, 0.8)]);
-    late.effects.get_mut("compressor").unwrap().enabled = true;
-    late.effects.get_mut("loudness").unwrap().enabled = true;
+    let late = with_bands(&[(LowShelf, 90.0, 2.0, 0.7), (Bell, 3000.0, 1.5, 0.8)]);
+    let late = turn_on(turn_on(late, "compressor", &[]), "loudness", &[]);
     vec![
         ("Flat", Sound::flat()),
         ("Bass Boost", with_bands(&[(LowShelf, 110.0, 6.0, 0.7), (Bell, 350.0, -1.5, 1.0)])),
@@ -678,10 +736,78 @@ pub fn builtin_presets() -> Vec<(&'static str, Sound)> {
     ]
 }
 
-pub fn user_presets() -> Vec<(String, Sound)> {
+/// Voice presets. Each one cuts the rumble below the voice, and the limiter stays on
+/// as in Flat. The gate comes first in the chain, so it also keeps Auto Gain from
+/// turning room noise up between words.
+fn mic_presets() -> Vec<(&'static str, Sound)> {
+    use FilterKind::*;
+    let clear = with_bands(&[(HighPass, 80.0, 0.0, 0.7), (Bell, 250.0, -2.0, 1.0), (Bell, 3500.0, 3.0, 0.9)]);
+    let clear = turn_on(clear, "gate", &[("threshold", -50.0), ("reduction", -15.0)]);
+    let clear = turn_on(clear, "compressor", &[("threshold", -20.0), ("ratio", 3.0)]);
+
+    let noisy = with_bands(&[(HighPass, 100.0, 0.0, 0.7), (Bell, 3000.0, 2.0, 1.0), (LowPass, 10_000.0, 0.0, 0.7)]);
+    let noisy = turn_on(
+        noisy,
+        "gate",
+        &[("threshold", -40.0), ("reduction", -30.0), ("attack", 2.0), ("release", 250.0)],
+    );
+
+    let quiet = with_bands(&[(HighPass, 80.0, 0.0, 0.7)]);
+    let quiet = turn_on(quiet, "gate", &[("threshold", -55.0), ("reduction", -20.0)]);
+    let quiet = turn_on(quiet, "autogain", &[("target", -20.0), ("maxgain", 20.0)]);
+
+    let laptop = with_bands(&[
+        (HighPass, 100.0, 0.0, 0.7),
+        (LowShelf, 200.0, 2.5, 0.7),
+        (Bell, 4000.0, 2.0, 1.0),
+        (HighShelf, 9000.0, -3.0, 0.7),
+    ]);
+    let laptop = turn_on(laptop, "gate", &[("threshold", -45.0)]);
+    let laptop = turn_on(laptop, "autogain", &[("target", -20.0), ("maxgain", 15.0)]);
+
+    let headset = with_bands(&[(HighPass, 100.0, 0.0, 0.7), (Bell, 180.0, -3.0, 0.9), (Bell, 5000.0, 1.5, 1.0)]);
+    let headset = turn_on(headset, "compressor", &[("threshold", -18.0), ("ratio", 2.5)]);
+
+    let podcast = with_bands(&[
+        (HighPass, 70.0, 0.0, 0.7),
+        (LowShelf, 120.0, 2.0, 0.7),
+        (Bell, 400.0, -2.0, 1.2),
+        (Bell, 4500.0, 2.5, 1.0),
+        (HighShelf, 10_000.0, 2.0, 0.7),
+    ]);
+    let podcast = turn_on(podcast, "gate", &[("threshold", -50.0), ("reduction", -20.0)]);
+    let podcast = turn_on(
+        podcast,
+        "compressor",
+        &[
+            ("threshold", -24.0),
+            ("ratio", 4.0),
+            ("attack", 10.0),
+            ("release", 120.0),
+            ("makeup", 4.0),
+        ],
+    );
+
+    vec![
+        ("Flat", Sound::flat()),
+        ("Clear Voice", clear),
+        ("Noisy Room", noisy),
+        ("Quiet Mic", quiet),
+        ("Laptop Mic", laptop),
+        ("Headset", headset),
+        ("Podcast", podcast),
+    ]
+}
+
+/// The presets saved on one tab.
+pub fn user_presets(dir: Direction) -> Vec<(String, Sound)> {
+    user_presets_in(&presets_dir(dir))
+}
+
+fn user_presets_in(folder: &Path) -> Vec<(String, Sound)> {
     let mut out = vec![];
-    if let Ok(dir) = std::fs::read_dir(presets_dir()) {
-        for e in dir.flatten() {
+    if let Ok(entries) = std::fs::read_dir(folder) {
+        for e in entries.flatten() {
             let path = e.path();
             if path.extension().is_some_and(|x| x == "json")
                 && let (Some(stem), Ok(data)) = (path.file_stem(), std::fs::read(&path))
@@ -697,23 +823,30 @@ pub fn user_presets() -> Vec<(String, Sound)> {
 }
 
 /// Keeps a preset name safe to use as a file name.
-pub fn preset_path(name: &str) -> Option<PathBuf> {
+pub fn preset_path(dir: Direction, name: &str) -> Option<PathBuf> {
+    preset_path_in(&presets_dir(dir), name)
+}
+
+fn preset_path_in(folder: &Path, name: &str) -> Option<PathBuf> {
     let name = name.trim();
     if name.is_empty() || name.contains(['/', '\\', '\0']) || name.starts_with('.') {
         return None;
     }
-    Some(presets_dir().join(format!("{name}.json")))
+    Some(folder.join(format!("{name}.json")))
 }
 
-pub fn save_preset(name: &str, sound: &Sound) -> std::io::Result<()> {
-    if builtin_presets().iter().any(|(n, _)| n.eq_ignore_ascii_case(name.trim())) {
+/// Saves a preset to one tab. Its name can't be one of that tab's built-in presets.
+pub fn save_preset(dir: Direction, name: &str, sound: &Sound) -> std::io::Result<()> {
+    if builtin_presets(dir).iter().any(|(n, _)| n.eq_ignore_ascii_case(name.trim())) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "A built-in preset already has that name",
         ));
     }
-    let path = preset_path(name).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "That name can't be used"))?;
-    std::fs::create_dir_all(presets_dir())?;
+    let folder = presets_dir(dir);
+    let path =
+        preset_path_in(&folder, name).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "That name can't be used"))?;
+    std::fs::create_dir_all(folder)?;
     std::fs::write(path, serde_json::to_vec_pretty(sound).expect("sound serializes"))
 }
 
@@ -845,7 +978,11 @@ mod tests {
 
     #[test]
     fn resetting_the_equalizer_leaves_the_other_effects_alone() {
-        let mut s = builtin_presets().into_iter().find(|(n, _)| *n == "Late Night").unwrap().1;
+        let mut s = builtin_presets(Direction::Output)
+            .into_iter()
+            .find(|(n, _)| *n == "Late Night")
+            .unwrap()
+            .1;
         s.preamp = -4.0;
         s.balance = 30.0;
         s.eq_enabled = false;
@@ -861,10 +998,12 @@ mod tests {
 
     #[test]
     fn sanitize_leaves_valid_sounds_alone() {
-        for (name, sound) in builtin_presets() {
-            let mut clean = sound.clone();
-            clean.sanitize();
-            assert_eq!(clean, sound, "{name}");
+        for dir in [Direction::Output, Direction::Mic] {
+            for (name, sound) in builtin_presets(dir) {
+                let mut clean = sound.clone();
+                clean.sanitize();
+                assert_eq!(clean, sound, "{name}");
+            }
         }
     }
 
@@ -906,10 +1045,140 @@ mod tests {
 
     #[test]
     fn preset_names_cannot_escape_the_presets_folder() {
-        assert!(preset_path("../evil").is_none());
-        assert!(preset_path(".hidden").is_none());
-        assert!(preset_path("  ").is_none());
-        assert!(preset_path("My Sound").is_some());
+        for dir in [Direction::Output, Direction::Mic] {
+            assert!(preset_path(dir, "../evil").is_none());
+            assert!(preset_path(dir, ".hidden").is_none());
+            assert!(preset_path(dir, "  ").is_none());
+            assert!(preset_path(dir, "My Sound").is_some());
+        }
+    }
+
+    #[test]
+    fn the_output_presets_are_the_ones_from_before() {
+        let names: Vec<&str> = builtin_presets(Direction::Output).iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            ["Flat", "Bass Boost", "Treble Boost", "Smile", "Vocal Clarity", "Late Night"]
+        );
+    }
+
+    #[test]
+    fn each_tab_lists_presets_for_its_own_effects() {
+        for dir in [Direction::Output, Direction::Mic] {
+            let presets = builtin_presets(dir);
+            assert_eq!(presets[0], ("Flat", Sound::flat()), "the default state names Flat");
+            for (i, (name, sound)) in presets.iter().enumerate() {
+                assert!(
+                    presets[..i].iter().all(|(n, _)| !n.eq_ignore_ascii_case(name)),
+                    "{name} is listed twice"
+                );
+                for (id, state) in &sound.effects {
+                    if state.enabled {
+                        assert!(
+                            dir.chain().contains(&id.as_str()),
+                            "{name} turns on {id}, which {dir:?} doesn't have"
+                        );
+                    }
+                    let spec = effect(id);
+                    for param in state.params.keys() {
+                        assert!(spec.params.iter().any(|p| p.id == param), "{name}: {id} has no {param}");
+                    }
+                }
+            }
+        }
+        // The Microphone's list is its own, not the Output's again.
+        let mic = builtin_presets(Direction::Mic);
+        assert!(
+            mic.iter()
+                .all(|(n, _)| *n == "Flat" || !builtin_presets(Direction::Output).iter().any(|(o, _)| o == n))
+        );
+        assert!(mic.iter().any(|(_, s)| s.is_on("gate")), "a microphone preset should use the gate");
+    }
+
+    /// A folder of its own under the system's temporary folder, removed when dropped.
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("equalizer-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_preset(folder: &Path, name: &str, sound: &Sound) {
+        std::fs::create_dir_all(folder).unwrap();
+        std::fs::write(folder.join(format!("{name}.json")), serde_json::to_vec(sound).unwrap()).unwrap();
+    }
+
+    fn names(folder: &Path) -> Vec<String> {
+        user_presets_in(folder).into_iter().map(|(n, _)| n).collect()
+    }
+
+    #[test]
+    fn the_two_tabs_keep_presets_in_separate_folders() {
+        let cfg = TempConfig::new("folders");
+        let (out, mic) = (presets_dir_in(&cfg.0, Direction::Output), presets_dir_in(&cfg.0, Direction::Mic));
+        assert_ne!(out, mic);
+        assert_eq!(out, cfg.0.join("presets"), "the Output keeps the folder from before 0.0.6");
+        write_preset(&out, "Music", &Sound::flat());
+        write_preset(&mic, "Voice", &Sound::flat());
+        assert_eq!(names(&out), ["Music"], "the Microphone's folder isn't read as a preset");
+        assert_eq!(names(&mic), ["Voice"]);
+    }
+
+    #[test]
+    fn presets_from_before_stay_on_both_tabs_and_are_copied_once() {
+        let cfg = TempConfig::new("split");
+        let (out, mic) = (presets_dir_in(&cfg.0, Direction::Output), presets_dir_in(&cfg.0, Direction::Mic));
+        let mut bassy = Sound::flat();
+        bassy.preamp = -3.0;
+        write_preset(&out, "Old One", &bassy);
+        write_preset(&out, "Old Two", &Sound::flat());
+        std::fs::write(out.join("notes.txt"), "not a preset").unwrap();
+
+        split_presets_in(&cfg.0).unwrap();
+        assert_eq!(names(&out), ["Old One", "Old Two"]);
+        assert_eq!(names(&mic), ["Old One", "Old Two"]);
+        assert_eq!(user_presets_in(&mic)[0].1, bassy);
+        assert!(!mic.join("notes.txt").exists());
+        assert!(!out.join(".microphone.tmp").exists());
+
+        // From now on, each tab's list is its own.
+        std::fs::remove_file(mic.join("Old Two.json")).unwrap();
+        write_preset(&out, "New Music", &Sound::flat());
+        split_presets_in(&cfg.0).unwrap();
+        assert_eq!(names(&mic), ["Old One"]);
+        assert_eq!(names(&out), ["New Music", "Old One", "Old Two"]);
+    }
+
+    #[test]
+    fn the_copy_runs_once_even_with_no_presets() {
+        let cfg = TempConfig::new("empty");
+        split_presets_in(&cfg.0).unwrap();
+        let mic = presets_dir_in(&cfg.0, Direction::Mic);
+        assert!(mic.is_dir());
+        // Presets saved on the Output later don't show up on the Microphone.
+        write_preset(&presets_dir_in(&cfg.0, Direction::Output), "Music", &Sound::flat());
+        split_presets_in(&cfg.0).unwrap();
+        assert!(names(&mic).is_empty());
+    }
+
+    #[test]
+    fn a_copy_cut_short_is_started_over() {
+        let cfg = TempConfig::new("cut");
+        let out = presets_dir_in(&cfg.0, Direction::Output);
+        write_preset(&out, "Kept", &Sound::flat());
+        write_preset(&out.join(".microphone.tmp"), "Half", &Sound::flat());
+        split_presets_in(&cfg.0).unwrap();
+        assert_eq!(names(&presets_dir_in(&cfg.0, Direction::Mic)), ["Kept"]);
     }
 
     #[test]

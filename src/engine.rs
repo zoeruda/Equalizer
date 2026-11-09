@@ -594,6 +594,12 @@ fn make_meter(
     }
     if monitor {
         props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+        // GNOME and KDE show every PulseAudio source output as an app using the
+        // microphone, including one that records a speaker's monitor. pipewire-pulse
+        // only lists Stream/Input/Audio nodes as source outputs, and WirePlumber still
+        // links this class. A meter on the microphone keeps the usual class, as it
+        // really does use it.
+        props.insert(*pw::keys::MEDIA_CLASS, "Stream/Input/Audio/Internal");
     }
     let stream = pw::stream::StreamRc::new(core.clone(), "Equalizer meter", props)?;
     let data = MeterData {

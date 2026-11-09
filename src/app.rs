@@ -982,11 +982,11 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                 list.remove(&c);
             }
             let current = ctx.state.borrow().chain(dir).preset.clone();
-            let mut entries: Vec<(String, Sound, bool)> = model::builtin_presets()
+            let mut entries: Vec<(String, Sound, bool)> = model::builtin_presets(dir)
                 .into_iter()
                 .map(|(n, s)| (n.to_string(), s, false))
                 .collect();
-            entries.extend(model::user_presets().into_iter().map(|(n, s)| (n, s, true)));
+            entries.extend(model::user_presets(dir).into_iter().map(|(n, s)| (n, s, true)));
             for (name, sound, user) in entries {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
                 let pick = gtk::Button::new();
@@ -1013,7 +1013,7 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                     del.set_tooltip_text(Some("Delete this preset"));
                     let (toasts, this2, name) = (toasts.clone(), this2.clone(), name.clone());
                     del.connect_clicked(move |_| {
-                        if let Some(path) = model::preset_path(&name) {
+                        if let Some(path) = model::preset_path(dir, &name) {
                             match std::fs::remove_file(path) {
                                 Ok(()) => toasts.add_toast(plain_toast(&format!("Deleted “{name}”"))),
                                 Err(e) => toasts.add_toast(plain_toast(&format!("Couldn't delete: {e}"))),
@@ -1043,7 +1043,11 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                 .placeholder_text("Preset name")
                 .activates_default(true)
                 .build();
-            let dialog = adw::AlertDialog::new(Some("Save Preset"), Some("Saves the equalizer and all the effects."));
+            let body = match dir {
+                Direction::Output => "Saves the equalizer and all the effects. It's listed on the Output tab only.",
+                Direction::Mic => "Saves the equalizer and all the effects. It's listed on the Microphone tab only.",
+            };
+            let dialog = adw::AlertDialog::new(Some("Save Preset"), Some(body));
             dialog.set_extra_child(Some(&entry));
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("save", "Save");
@@ -1063,7 +1067,7 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
                 }
                 let name = name_entry.text().trim().to_string();
                 let sound = ctx3.state.borrow().chain(dir).sound.clone();
-                match model::save_preset(&name, &sound) {
+                match model::save_preset(dir, &name, &sound) {
                     Ok(()) => {
                         ctx3.state.borrow_mut().chain_mut(dir).preset = name.clone();
                         ctx3.mark_changed();
@@ -1488,6 +1492,9 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
         return;
     };
 
+    if let Err(e) = model::split_presets() {
+        eprintln!("equalizer: couldn't make the Microphone's preset folder: {e}");
+    }
     let (tx, rx) = async_channel::unbounded();
     let ctx = Rc::new(Ctx {
         state: RefCell::new(model::load_state()),

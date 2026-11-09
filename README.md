@@ -21,7 +21,7 @@
 - **Graphical equalizer:** up to 32 bands, with a live spectrum behind an interactive graph
 - **Full effect chains:** separate chains for your output and your microphone, including auto gain, compressor, limiter, loudness, and noise gate
 - **System-wide:** a virtual device that all ordinary apps pass through
-- **Presets:** save the equalizer and every effect together
+- **Presets:** save the equalizer and every effect together, with separate sets for listening and for your voice
 - **Headphone correction:** import AutoEq and Equalizer APO files
 - **Runs in the background:** sound processing can continue after you close the window, and it can start at login
 
@@ -144,15 +144,21 @@ The sidebar lists the effects in the order sound passes through them.
 | Loudness | Compressor |
 | Limiter | Limiter |
 
-Presets save the equalizer and every effect. You can also import AutoEq and
-Equalizer APO files, which is the usual format for headphone correction.
+Presets save the equalizer and every effect. The Output and the Microphone each have
+their own presets, since their effects differ: the Output's are for listening, and
+the Microphone's are for your voice, such as Clear Voice, Noisy Room and Podcast.
+You can also import AutoEq and Equalizer APO files, which is the usual format for
+headphone correction.
 
 Closing the window keeps the sound processing running. Open the app again to bring
 the window back, or use **Quit** in the menu (Ctrl+Q) to stop. Both behaviors, and
 starting at login, are in the menu.
 
 Settings live in `~/.config/equalizer/`, or in
-`~/.var/app/io.github.zoeruda.Equalizer/config/equalizer/` for the Flatpak.
+`~/.var/app/io.github.zoeruda.Equalizer/config/equalizer/` for the Flatpak. Your
+Output presets are in its `presets` folder, and your Microphone presets in
+`presets/microphone`. Presets saved before 0.0.6 were shared, so they're copied to
+both.
 
 ## How it works
 
@@ -173,10 +179,17 @@ entry in the `EFFECTS` table in `model.rs`, plus a place in `Direction::chain`.
 
     cargo test
     DISPLAY=:0 python3 tests/measure.py target/release/equalizer
+    DISPLAY=:0 python3 tests/mic.py target/release/equalizer
 
 The second one runs the real app with tones going to a temporary silent device. It
 compares what comes out with what the graph shows, and it needs a display and a
 running PipeWire session.
+
+The third does the same for the Microphone. It never opens your real microphone: it
+plays its tones into a temporary fake one. It also clicks through the Microphone tab
+using accessibility (AT-SPI), so it needs the Python bindings for it (`python3-gi`
+with `Atspi` 2.0), and the window must stay uncovered. Quit Equalizer before running
+either one, as only one copy can run.
 
 ## Special recognition
 
