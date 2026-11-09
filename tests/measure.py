@@ -70,11 +70,13 @@ def peak_db(path):
     return 20 * math.log10(max(max(map(abs, v[first + RATE // 10 :]), default=1), 1) / 32767)
 
 
-def measure(freq, db=LEVEL_DB, seconds=1.0):
+def measure(freq, db=LEVEL_DB, seconds=1.0, into="equalizer_sink"):
+    """Plays a tone into the app's device (or `into`) and records what the silent device plays."""
     out = os.path.join(tmp, "out.wav")
     rec = subprocess.Popen(["pw-record", "--target=eqmeasure", "-P", "{stream.capture.sink=true}", "--rate", str(RATE), "--channels", "2", "--format", "s16", out], stderr=subprocess.DEVNULL)
     time.sleep(0.35)
-    subprocess.run(["pw-play", "--target=equalizer_sink", tone(freq, db, seconds)], stderr=subprocess.DEVNULL)
+    # With no fallback, a missing device fails the test instead of playing on the speakers.
+    subprocess.run(["pw-play", f"--target={into}", "-P", "{ node.dont-fallback = true node.dont-reconnect = true }", tone(freq, db, seconds)], stderr=subprocess.DEVNULL)
     time.sleep(0.15)
     rec.send_signal(signal.SIGINT)
     rec.wait()
@@ -122,8 +124,8 @@ class App:
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
         self.p = subprocess.Popen([BIN], env=env, stderr=subprocess.DEVNULL)
         time.sleep(1.8)
-        # WirePlumber restores whatever volume this device last had, which would
-        # shift every measurement. The raw values keep any left/right difference.
+        # The app's volume is the silent device's, at whatever it was last set to, which
+        # would shift every measurement. The raw values keep any left/right difference.
         self.volume = re.findall(r": (\d+) /", run("pactl", "get-sink-volume", "equalizer_sink"))
         if not self.volume:
             self.p.terminate()
@@ -237,6 +239,25 @@ for name in ["autogain", "compressor"]:
         run("pactl", "set-sink-volume", "equalizer_sink", "50%")
         half = measure(1000, db=-14.0, seconds=3.0)
         check(f"{name} on: 50% volume lowers the output by 18 dB", half - full, 60 * math.log10(0.5))
+
+print("Active on is as loud as Active off")
+# The app's volume is the real device's, so the same sound plays as loud through the
+# app as straight into the device, at any volume.
+with App(lambda s: None):
+    run("pactl", "set-sink-volume", "eqmeasure", "40%")
+    time.sleep(0.6)
+    shown = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "equalizer_sink"))
+    print(f"  {'ok  ' if shown == ['40', '40'] else 'FAIL'} the device set to 40%: the app's volume shows {'/'.join(shown)}%")
+    if shown != ["40", "40"]:
+        fails.append("app shows the device's volume")
+    check("the device at 40%: through the app vs straight into it", measure(1000) - measure(1000, into="eqmeasure"), 0.0, tol=0.3)
+    run("pactl", "set-sink-volume", "equalizer_sink", "70%")
+    time.sleep(0.6)
+    device = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "eqmeasure"))
+    print(f"  {'ok  ' if device == ['70', '70'] else 'FAIL'} the app set to 70%: the device follows to {'/'.join(device)}%")
+    if device != ["70", "70"]:
+        fails.append("device follows the app's volume")
+    check("at 70%: through the app vs straight into the device", measure(1000) - measure(1000, into="eqmeasure"), 0.0, tol=0.3)
 
 print("Default device")
 before = run("pw-metadata", "-n", "default", "0", "default.configured.audio.sink")

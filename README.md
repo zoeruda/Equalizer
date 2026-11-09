@@ -123,6 +123,11 @@ Equalizer adds a virtual device and makes it your default output, so all ordinar
 apps pass through it. Turn **Active** off, or pick another output in system
 settings, and sound goes straight to the device again.
 
+While Active is on, Equalizer's volume is your speakers' or headphones' own volume:
+the volume keys and the desktop's slider change the real device, and a change made on
+the device shows on Equalizer's. So Active on and off play at the same loudness, and
+the volume stays where you set it when you turn Active off or quit.
+
 On the graph:
 
 | Action | How |

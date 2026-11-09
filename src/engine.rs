@@ -10,7 +10,7 @@ use pw::spa;
 use pw::spa::pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray, deserialize::PodDeserializer, serialize::PodSerializer};
 use pw::spa::utils::dict::DictRef;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::CString;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,8 @@ use crate::model::{Direction, SINK_NAME, SOURCE_NAME, effect};
 
 const OUT_STREAM: &str = "equalizer_out";
 const MIC_STREAM: &str = "equalizer_mic_in";
-/// The graph nodes that apply the virtual output's volume, one per channel.
+/// The graph controls that receive the virtual output's volume, one per channel.
+/// Nothing passes through them: the real device's volume is the one that's applied.
 const VOLUME_L: &str = "volume_l";
 const VOLUME_R: &str = "volume_r";
 /// How long streams get to leave the virtual output before it's removed anyway.
@@ -164,29 +165,27 @@ pub fn module_args(dir: Direction, hw: &str, controls: &BTreeMap<String, f32>, p
         }
     }
     let first = chain[0];
-    let mut outputs = format!("\"{0}:Output L\" \"{0}:Output R\"", chain[chain.len() - 1]);
+    let outputs = format!("\"{0}:Output L\" \"{0}:Output R\"", chain[chain.len() - 1]);
     let mut volumes = String::new();
-    // The virtual output's volume would otherwise be applied as the sound enters the
-    // chain, where Auto Gain and the compressor take a lowered slider for quiet sound
-    // and undo it. These controls apply it after the chain instead. The microphone
-    // needs nothing: a source's volume is already applied after its chain.
+    // The virtual output's volume isn't applied anywhere: the real device's volume
+    // is the only one that changes the sound, and the virtual one shows it and passes
+    // changes on to it (see `Inner::forward_volume`). Without these controls the
+    // virtual device's volume would be applied as the sound enters the chain, so it
+    // goes to controls that nothing passes through. The microphone needs nothing: a
+    // source's volume is already applied after its chain.
     if dir == Direction::Output {
-        let last = chain[chain.len() - 1];
         let _ = writeln!(
             nodes,
             "{{ type = builtin name = {VOLUME_L} label = linear }} {{ type = builtin name = {VOLUME_R} label = linear }}"
         );
-        let _ = writeln!(
-            links,
-            "{{ output = \"{last}:Output L\" input = \"{VOLUME_L}:In\" }} {{ output = \"{last}:Output R\" input = \"{VOLUME_R}:In\" }}"
-        );
-        outputs = format!("\"{VOLUME_L}:Out\" \"{VOLUME_R}:Out\"");
         // One per channel, in audio.position order.
         volumes = format!("capture.volumes = [ {{ control = \"{VOLUME_L}:Mult\" }} {{ control = \"{VOLUME_R}:Mult\" }} ] ");
     }
     let (capture, playback, description) = match dir {
         Direction::Output => (
-            format!("node.name = \"{SINK_NAME}\" node.description = \"Equalizer\" media.class = Audio/Sink"),
+            // WirePlumber would otherwise put back the volume it had last time, which
+            // would then be passed on to the real device.
+            format!("node.name = \"{SINK_NAME}\" node.description = \"Equalizer\" media.class = Audio/Sink state.restore-props = false"),
             format!("node.name = \"{OUT_STREAM}\" node.description = \"Equalizer output\" node.passive = true target.object = {hw}"),
             "Equalizer",
         ),
@@ -248,27 +247,187 @@ impl Drain {
     }
 }
 
-/// The gain, per channel, that undoes the volume in a virtual device's Props. Silence
-/// stays silence, so muted or at zero it's 0. None if the Props don't carry a volume.
-fn volume_gain(props: &Value) -> Option<[f32; 2]> {
-    let Value::Object(obj) = props else { return None };
-    let mut volumes = None;
-    let mut mute = false;
+/// How close two volumes must be to count as the same, in dB.
+const SAME_DB: f32 = 0.05;
+/// How close the real device's volume must be to one just sent to it to count as that
+/// change coming back. Hardware mixers round to their own steps.
+const ECHO_DB: f32 = 0.75;
+/// How long a volume sent to the real device is waited for.
+const ECHO_WAIT: Duration = Duration::from_millis(1500);
+
+/// A volume as PipeWire's Props carry it: a linear gain per channel, and mute.
+#[derive(Clone, Debug, PartialEq)]
+struct Volume {
+    channels: Vec<f32>,
+    mute: bool,
+}
+
+impl Volume {
+    /// The same volume for `n` channels. When the counts differ, every channel gets the
+    /// loudest one.
+    fn for_channels(&self, n: usize) -> Volume {
+        let channels = if self.channels.len() == n {
+            self.channels.clone()
+        } else {
+            vec![self.channels.iter().copied().fold(0.0f32, f32::max); n.max(1)]
+        };
+        Volume { channels, mute: self.mute }
+    }
+
+    /// Whether the two sound the same: the same mute, and each channel within `db`.
+    fn close(&self, other: &Volume, db: f32) -> bool {
+        let level = |v: f32| if v > 1e-5 { 20.0 * v.log10() } else { -100.0 };
+        self.mute == other.mute
+            && self.channels.len() == other.channels.len()
+            && self
+                .channels
+                .iter()
+                .zip(&other.channels)
+                .all(|(a, b)| (level(*a) - level(*b)).abs() <= db)
+    }
+
+    /// The gain, per channel, that undoes this volume. Silence stays silence.
+    fn undo(&self) -> [f32; 2] {
+        let v = self.for_channels(2).channels;
+        let gain = |x: f32| if self.mute || x.is_nan() || x <= 0.0 { 0.0 } else { 1.0 / x };
+        [gain(v[0]), gain(v[1])]
+    }
+}
+
+/// The volume, and the volume of the monitor, in a node's Props.
+fn props_volumes(props: &Value) -> (Option<Volume>, Option<Volume>) {
+    let Value::Object(obj) = props else { return (None, None) };
+    let (mut volume, mut mute, mut monitor, mut monitor_mute) = (None, false, None, false);
     for p in &obj.properties {
         match (p.key, &p.value) {
-            (spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => {
-                volumes = Some(v.clone());
-            }
+            (spa_sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => volume = Some(v.clone()),
             (spa_sys::SPA_PROP_mute, Value::Bool(m)) => mute = *m,
+            (spa_sys::SPA_PROP_monitorVolumes, Value::ValueArray(ValueArray::Float(v))) if !v.is_empty() => monitor = Some(v.clone()),
+            (spa_sys::SPA_PROP_monitorMute, Value::Bool(m)) => monitor_mute = *m,
             _ => {}
         }
     }
-    let v = volumes?;
-    let gain = |i: usize| {
-        let v = v[i.min(v.len() - 1)];
-        if mute || v.is_nan() || v <= 0.0 { 0.0 } else { 1.0 / v }
-    };
-    Some([gain(0), gain(1)])
+    (
+        volume.map(|channels| Volume { channels, mute }),
+        monitor.map(|channels| Volume {
+            channels,
+            mute: monitor_mute,
+        }),
+    )
+}
+
+fn prop(key: u32, value: Value) -> Property {
+    Property {
+        key,
+        flags: PropertyFlags::empty(),
+        value,
+    }
+}
+
+/// Props that set a volume. Inside a Route, they carry the Route's id.
+fn volume_props(v: &Volume, id: spa::param::ParamType) -> Value {
+    Value::Object(Object {
+        type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+        id: id.as_raw(),
+        properties: vec![
+            prop(
+                spa_sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(ValueArray::Float(v.channels.clone())),
+            ),
+            prop(spa_sys::SPA_PROP_mute, Value::Bool(v.mute)),
+        ],
+    })
+}
+
+/// Sets a device's volume on its active route, as the desktop's own volume control
+/// does, so that its hardware mixer is used and the volume is remembered.
+fn route_volume(route: &Route, v: &Volume) -> Value {
+    Value::Object(Object {
+        type_: spa::utils::SpaTypes::ObjectParamRoute.as_raw(),
+        id: spa::param::ParamType::Route.as_raw(),
+        properties: vec![
+            prop(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(route.index)),
+            prop(spa_sys::SPA_PARAM_ROUTE_device, Value::Int(route.device)),
+            prop(spa_sys::SPA_PARAM_ROUTE_props, volume_props(v, spa::param::ParamType::Route)),
+            prop(spa_sys::SPA_PARAM_ROUTE_save, Value::Bool(true)),
+        ],
+    })
+}
+
+/// A route's index, its device, and whether it's an output.
+fn route_of(value: &Value) -> Option<(i32, i32, bool)> {
+    let Value::Object(obj) = value else { return None };
+    let (mut index, mut device, mut output) = (None, None, false);
+    for p in &obj.properties {
+        match (p.key, &p.value) {
+            (spa_sys::SPA_PARAM_ROUTE_index, Value::Int(i)) => index = Some(*i),
+            (spa_sys::SPA_PARAM_ROUTE_device, Value::Int(d)) => device = Some(*d),
+            (spa_sys::SPA_PARAM_ROUTE_direction, Value::Id(d)) => output = d.0 == spa_sys::SPA_DIRECTION_OUTPUT,
+            _ => {}
+        }
+    }
+    Some((index?, device?, output))
+}
+
+fn send_param(value: &Value, send: impl FnOnce(&Pod)) {
+    match PodSerializer::serialize(std::io::Cursor::new(Vec::new()), value) {
+        Ok((bytes, _)) => {
+            if let Some(pod) = Pod::from_bytes(&bytes.into_inner()) {
+                send(pod);
+            }
+        }
+        Err(e) => eprintln!("equalizer: couldn't encode a volume: {e:?}"),
+    }
+}
+
+fn set_volume(node: &Node, v: &Volume) {
+    send_param(&volume_props(v, spa::param::ParamType::Props), |pod| {
+        node.set_param(spa::param::ParamType::Props, 0, pod)
+    });
+}
+
+struct Route {
+    index: i32,
+    device: i32,
+}
+
+/// The real output while the Output chain is on. Its volume is the only one that
+/// changes the sound: Equalizer's device shows it and passes changes on to it.
+struct RealOutput {
+    name: String,
+    /// Declared before the proxies they listen to, so they're dropped first.
+    _node_listener: pw::node::NodeListener,
+    _device_listener: Option<pw::device::DeviceListener>,
+    node: Node,
+    device: Option<pw::device::Device>,
+    card_device: Option<i32>,
+    route: Option<Route>,
+    volume: Option<Volume>,
+    monitor: Option<Volume>,
+    /// Whether the device's monitor is also turned down with its volume
+    /// (`monitor.channel-volumes`). ALSA devices don't do that, null sinks do.
+    monitor_follows_volume: bool,
+}
+
+impl RealOutput {
+    /// The gain the monitor applies, which the post meter undoes.
+    fn monitor_gain(&self) -> Option<Volume> {
+        monitor_gain(self.volume.as_ref(), self.monitor.as_ref(), self.monitor_follows_volume)
+    }
+}
+
+/// A device's monitor applies its `monitorVolumes`, times its volume when the monitor
+/// follows the volume.
+fn monitor_gain(volume: Option<&Volume>, monitor: Option<&Volume>, follows_volume: bool) -> Option<Volume> {
+    let mut m = monitor?.clone();
+    if follows_volume && let Some(v) = volume {
+        let v = v.for_channels(m.channels.len());
+        for (a, b) in m.channels.iter_mut().zip(&v.channels) {
+            *a *= b;
+        }
+        m.mute |= v.mute;
+    }
+    Some(m)
 }
 
 /// The default device to hand back, if it still exists. WirePlumber remembers every
@@ -304,7 +463,8 @@ struct Chain {
     /// dropped first: it unhooks itself from the node.
     volume_listener: Option<pw::node::NodeListener>,
     control: Option<Node>,
-    /// What the post meter needs, per channel, to undo the virtual device's volume.
+    /// What the post meter needs, per channel, to undo the volume in what it records:
+    /// the virtual microphone's, or the real output's monitor.
     gain: [f32; 2],
     claim_default: bool,
     previous_default: Option<String>,
@@ -362,6 +522,16 @@ struct Inner {
     metering: Option<Direction>,
     meters: Vec<Meter>,
     last_devices: (Vec<Device>, Vec<Device>),
+    registry: pw::registry::RegistryRc,
+    post: Arc<Mutex<Analyzer>>,
+    real: Option<RealOutput>,
+    /// Equalizer's own output volume, as last reported.
+    sink_volume: Option<Volume>,
+    /// Whether Equalizer's output has shown the real device's volume yet. Until then,
+    /// its own volume is only the one it started with.
+    synced: bool,
+    /// Volumes recently sent to the real device, to recognize them coming back.
+    sent: VecDeque<(Volume, Instant)>,
 }
 
 const DEFAULT_KEYS: [&str; 2] = ["default.configured.audio.sink", "default.configured.audio.source"];
@@ -439,6 +609,64 @@ impl Inner {
         if c.on() && c.draining.is_none() { c.gain } else { [1.0; 2] }
     }
 
+    /// The post meter records the real device's monitor, which some devices turn down
+    /// with their volume. Undoing it shows only what the effects do.
+    fn update_post_gain(&mut self) {
+        let gain = self.real.as_ref().and_then(RealOutput::monitor_gain).map_or([1.0; 2], |m| m.undo());
+        self.chains[0].gain = gain;
+        if let Ok(mut a) = self.post.lock() {
+            a.gain = self.post_gain();
+        }
+    }
+
+    /// Shows a change to the real device's volume, made anywhere, on Equalizer's output.
+    fn follow_real(&mut self) {
+        let now = Instant::now();
+        self.sent.retain(|(_, t)| now.duration_since(*t) < ECHO_WAIT);
+        let Some(v) = self.real.as_ref().and_then(|r| r.volume.clone()) else {
+            return;
+        };
+        // Our own change coming back, perhaps rounded to the hardware's steps.
+        if self.sent.iter().any(|(x, _)| x.close(&v, ECHO_DB)) {
+            return;
+        }
+        let shown = v.for_channels(2);
+        if self.sink_volume.as_ref().is_some_and(|s| s.close(&shown, SAME_DB)) {
+            self.synced = true;
+            return;
+        }
+        if let Some(node) = &self.chains[0].control {
+            set_volume(node, &shown);
+        }
+    }
+
+    /// Passes a change to Equalizer's output volume on to the real device.
+    fn forward_volume(&mut self, v: Volume) {
+        self.sink_volume = Some(v.clone());
+        let Some(real) = &self.real else { return };
+        let Some(current) = &real.volume else { return };
+        if v.close(&current.for_channels(v.channels.len()), SAME_DB) {
+            self.synced = true;
+            return;
+        }
+        if !self.synced {
+            // Equalizer's output has just appeared, at the volume it starts with. It
+            // shows the real device's volume first, and only then passes changes on.
+            if let Some(node) = &self.chains[0].control {
+                set_volume(node, &current.for_channels(2));
+            }
+            return;
+        }
+        let out = v.for_channels(current.channels.len());
+        match (&real.device, &real.route) {
+            (Some(device), Some(route)) => send_param(&route_volume(route, &out), |pod| {
+                device.set_param(spa::param::ParamType::Route, 0, pod)
+            }),
+            _ => set_volume(&real.node, &out),
+        }
+        self.sent.push_back((out, Instant::now()));
+    }
+
     fn node_id(&self, name: &str) -> Option<u32> {
         self.nodes.iter().find(|(_, n)| n.name == name).map(|(id, _)| *id)
     }
@@ -468,6 +696,10 @@ impl Inner {
         chain.volume_listener = None;
         chain.control = None;
         chain.gain = [1.0; 2];
+        if dir == 0 {
+            self.sink_volume = None;
+            self.synced = false;
+        }
         chain.pending.clear();
         chain.claim_default = false;
         chain.draining = None;
@@ -570,6 +802,142 @@ fn set_params(node: &Node, params: &[(String, f32)]) {
         }
         Err(e) => eprintln!("equalizer: couldn't encode settings: {e:?}"),
     }
+}
+
+fn bind_global<T: pw::proxy::ProxyT>(registry: &pw::registry::RegistryRc, id: u32, type_: pw::types::ObjectType) -> Result<T, pw::Error> {
+    registry.bind(&GlobalObject {
+        id,
+        permissions: pw::permissions::PermissionFlags::empty(),
+        type_,
+        version: 0,
+        props: None::<&DictRef>,
+    })
+}
+
+/// Keeps `Inner::real` on the Output chain's real device while the chain is on.
+fn track_real_output(inner: &Rc<RefCell<Inner>>) {
+    let mut s = inner.borrow_mut();
+    let chain = &s.chains[0];
+    let want = if chain.on() && chain.draining.is_none() {
+        chain.hw.clone()
+    } else {
+        None
+    };
+    if s.real.as_ref().map(|r| r.name.clone()) == want {
+        return;
+    }
+    s.real = None;
+    s.sent.clear();
+    // A different device: Equalizer's output shows its volume before passing changes on.
+    s.synced = false;
+    s.update_post_gain();
+    let Some(name) = want else { return };
+    let Some(id) = s.node_id(&name) else { return };
+    let node: Node = match bind_global(&s.registry, id, pw::types::ObjectType::Node) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("equalizer: can't follow the volume of {name}: {e}");
+            return;
+        }
+    };
+    let (weak, weak2) = (Rc::downgrade(inner), Rc::downgrade(inner));
+    let listener = node
+        .add_listener_local()
+        .info(move |info| {
+            let Some(props) = info.props() else { return };
+            // Later info events can leave it out, so only one that has it counts.
+            if let Some(follows) = props.get("monitor.channel-volumes").map(|v| matches!(v, "true" | "1"))
+                && let Some(inner) = weak2.upgrade()
+                && let Ok(mut s) = inner.try_borrow_mut()
+                && let Some(real) = s.real.as_mut()
+            {
+                real.monitor_follows_volume = follows;
+                s.update_post_gain();
+            }
+            let device = props.get("device.id").and_then(|v| v.parse().ok());
+            let card_device = props.get("card.profile.device").and_then(|v| v.parse().ok());
+            if let (Some(inner), Some(device), Some(card_device)) = (weak2.upgrade(), device, card_device) {
+                bind_route(&inner, device, card_device);
+            }
+        })
+        .param(move |_, id, _, _, param| {
+            if id != spa::param::ParamType::Props {
+                return;
+            }
+            let Some(param) = param else { return };
+            let Ok((_, value)) = PodDeserializer::deserialize_any_from(param.as_bytes()) else {
+                return;
+            };
+            let (volume, monitor) = props_volumes(&value);
+            let Some(inner) = weak.upgrade() else { return };
+            let Ok(mut s) = inner.try_borrow_mut() else { return };
+            let Some(real) = s.real.as_mut() else { return };
+            if monitor.is_some() {
+                real.monitor = monitor;
+            }
+            if volume.is_some() {
+                real.volume = volume;
+            }
+            s.update_post_gain();
+            s.follow_real();
+        })
+        .register();
+    node.subscribe_params(&[spa::param::ParamType::Props]);
+    s.real = Some(RealOutput {
+        name,
+        _node_listener: listener,
+        _device_listener: None,
+        node,
+        device: None,
+        card_device: None,
+        route: None,
+        volume: None,
+        monitor: None,
+        monitor_follows_volume: false,
+    });
+}
+
+/// Finds the route the real output plays through, to set its volume there.
+fn bind_route(inner: &Rc<RefCell<Inner>>, device_id: u32, card_device: i32) {
+    let Ok(mut s) = inner.try_borrow_mut() else { return };
+    let registry = s.registry.clone();
+    let Some(real) = s.real.as_mut() else { return };
+    if real.device.is_some() {
+        return;
+    }
+    let device: pw::device::Device = match bind_global(&registry, device_id, pw::types::ObjectType::Device) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("equalizer: can't set the volume through the device: {e}");
+            return;
+        }
+    };
+    let weak = Rc::downgrade(inner);
+    let listener = device
+        .add_listener_local()
+        .param(move |_, id, _, _, param| {
+            if id != spa::param::ParamType::Route {
+                return;
+            }
+            let Some(param) = param else { return };
+            let Ok((_, value)) = PodDeserializer::deserialize_any_from(param.as_bytes()) else {
+                return;
+            };
+            let Some((index, device, output)) = route_of(&value) else { return };
+            let Some(inner) = weak.upgrade() else { return };
+            let Ok(mut s) = inner.try_borrow_mut() else { return };
+            if let Some(real) = s.real.as_mut()
+                && output
+                && real.card_device == Some(device)
+            {
+                real.route = Some(Route { index, device });
+            }
+        })
+        .register();
+    device.subscribe_params(&[spa::param::ParamType::Route]);
+    real.card_device = Some(card_device);
+    real.device = Some(device);
+    real._device_listener = Some(listener);
 }
 
 fn make_meter(
@@ -694,12 +1062,19 @@ fn run(
         metering: None,
         meters: vec![],
         last_devices: (vec![], vec![]),
+        registry: registry.clone(),
+        post: post.clone(),
+        real: None,
+        sink_volume: None,
+        synced: false,
+        sent: VecDeque::new(),
     }));
 
     // Rebuilds the meter streams to match the current state.
     let rebuild_meters: Rc<dyn Fn()> = {
         let (inner, core, pre, post) = (inner.clone(), core.clone(), pre.clone(), post.clone());
         Rc::new(move || {
+            track_real_output(&inner);
             let mut s = inner.borrow_mut();
             for m in s.meters.drain(..) {
                 let _ = m.stream.disconnect();
@@ -849,7 +1224,11 @@ fn run(
                         } else {
                             None
                         };
+                        let is_real = inner.borrow().chains[0].hw.as_deref() == Some(name.as_str());
                         inner.borrow_mut().nodes.insert(g.id, info);
+                        if is_real && dir.is_none() {
+                            rebuild();
+                        }
                         if let Some(d) = dir {
                             let mut s = inner.borrow_mut();
                             match reg.bind::<Node, _>(g) {
@@ -858,9 +1237,10 @@ fn run(
                                     if !pending.is_empty() {
                                         set_params(&node, &pending);
                                     }
-                                    // The post meter measures after the virtual device's
-                                    // volume. Following it lets the graphs show only what
-                                    // the effects do, wherever the slider is.
+                                    // The Output passes changes to its volume on to the
+                                    // real device. The microphone's post meter measures
+                                    // after the virtual device's volume, and following it
+                                    // lets the graphs show only what the effects do.
                                     // Weak, as the listener is kept inside `inner` itself.
                                     let (weak, meter) = (Rc::downgrade(&inner), post.clone());
                                     let listener = node
@@ -873,9 +1253,16 @@ fn run(
                                             let Ok((_, value)) = PodDeserializer::deserialize_any_from(param.as_bytes()) else {
                                                 return;
                                             };
-                                            let Some(gain) = volume_gain(&value) else { return };
                                             let Some(inner) = weak.upgrade() else { return };
                                             let Ok(mut s) = inner.try_borrow_mut() else { return };
+                                            if d == 0 {
+                                                if let (Some(volume), _) = props_volumes(&value) {
+                                                    s.forward_volume(volume);
+                                                }
+                                                return;
+                                            }
+                                            let (Some(volume), _) = props_volumes(&value) else { return };
+                                            let gain = volume.undo();
                                             s.chains[d].gain = gain;
                                             if let Ok(mut a) = meter.lock() {
                                                 a.gain = s.post_gain();
@@ -1172,26 +1559,105 @@ mod tests {
         let a = module_args(Direction::Output, "hw_sink", &c, Path::new("/x/lsp.so"));
         assert!(a.contains("inputs = [ \"autogain:Input L\""));
         assert!(a.contains("{ output = \"eq:Output R\" input = \"loudness:Input R\" }"));
-        assert!(a.contains("outputs = [ \"volume_l:Out\" \"volume_r:Out\" ]"));
+        assert!(a.contains("outputs = [ \"limiter:Output L\" \"limiter:Output R\" ]"));
         assert!(a.contains("target.object = \"hw_sink\""));
         assert!(a.contains(SINK_NAME));
         assert!(a.contains("\"Gain 0 (G)\" = 1.0"));
     }
 
     #[test]
-    fn the_output_volume_comes_after_the_whole_chain() {
+    fn the_output_volume_changes_nothing_in_the_chain() {
         let c = plugin_controls(&Sound::flat(), Direction::Output);
         let a = module_args(Direction::Output, "hw_sink", &c, Path::new("/x/lsp.so"));
+        // The volume goes to controls that nothing passes through, so the virtual
+        // device doesn't apply it as the sound enters the chain either.
         assert!(a.contains("{ type = builtin name = volume_l label = linear }"));
         assert!(a.contains("{ type = builtin name = volume_r label = linear }"));
-        assert!(a.contains("{ output = \"limiter:Output L\" input = \"volume_l:In\" }"));
-        assert!(a.contains("{ output = \"limiter:Output R\" input = \"volume_r:In\" }"));
+        assert!(!a.contains("volume_l:In") && !a.contains("volume_l:Out"), "{a}");
         // Left then right, matching audio.position, and inside filter.graph.
         let vols = "capture.volumes = [ { control = \"volume_l:Mult\" } { control = \"volume_r:Mult\" } ] }";
         assert!(a.contains(vols), "{a}");
         assert!(a.find(vols) < a.find("audio.channels"));
-        assert_eq!(a.matches("volume_l:In").count(), 1);
         assert!(!a.contains("playback.volumes"));
+        // WirePlumber mustn't put back an old volume, which would be passed on.
+        let capture = &a[a.find("capture.props").unwrap()..a.find("playback.props").unwrap()];
+        assert!(capture.contains("state.restore-props = false"), "{capture}");
+    }
+
+    fn vol(channels: &[f32], mute: bool) -> Volume {
+        Volume {
+            channels: channels.to_vec(),
+            mute,
+        }
+    }
+
+    #[test]
+    fn volumes_match_across_channel_counts() {
+        assert_eq!(vol(&[0.5, 0.3], false).for_channels(2), vol(&[0.5, 0.3], false));
+        // A mono or surround device gets the loudest channel on every channel.
+        assert_eq!(vol(&[0.5, 0.3], true).for_channels(1), vol(&[0.5], true));
+        assert_eq!(vol(&[0.4], false).for_channels(2), vol(&[0.4, 0.4], false));
+        assert_eq!(vol(&[0.2, 0.6], false).for_channels(6).channels, vec![0.6; 6]);
+    }
+
+    #[test]
+    fn volumes_count_as_the_same_within_a_few_tenths_of_a_db() {
+        let a = vol(&[0.5, 0.5], false);
+        assert!(a.close(&vol(&[0.502, 0.5], false), SAME_DB));
+        assert!(!a.close(&vol(&[0.55, 0.5], false), SAME_DB));
+        // A hardware mixer's rounding still counts as our own change coming back.
+        assert!(a.close(&vol(&[0.47, 0.53], false), ECHO_DB));
+        assert!(!a.close(&vol(&[0.4, 0.5], false), ECHO_DB));
+        assert!(!a.close(&vol(&[0.5, 0.5], true), ECHO_DB), "mute differs");
+        assert!(!a.close(&vol(&[0.5], false), ECHO_DB), "channel counts differ");
+        assert!(
+            vol(&[0.0, 0.0], false).close(&vol(&[0.0, 0.0], false), SAME_DB),
+            "silence equals silence"
+        );
+    }
+
+    fn volume_props_with_monitor(channels: Vec<f32>, monitor: Vec<f32>) -> Value {
+        let mut v = volume_props(&vol(&channels, false), spa::param::ParamType::Props);
+        if let Value::Object(o) = &mut v {
+            o.properties.push(prop(
+                spa_sys::SPA_PROP_monitorVolumes,
+                Value::ValueArray(ValueArray::Float(monitor)),
+            ));
+            o.properties.push(prop(spa_sys::SPA_PROP_monitorMute, Value::Bool(false)));
+        }
+        v
+    }
+
+    #[test]
+    fn a_devices_props_give_its_volume_and_its_monitors() {
+        let (v, m) = props_volumes(&volume_props_with_monitor(vec![0.25, 0.5], vec![1.0, 1.0]));
+        assert_eq!(v, Some(vol(&[0.25, 0.5], false)));
+        assert_eq!(m, Some(vol(&[1.0, 1.0], false)));
+        assert_eq!(props_volumes(&Value::Bool(true)), (None, None));
+    }
+
+    #[test]
+    fn the_post_meter_undoes_what_the_monitor_applies() {
+        // ALSA: the volume is in the hardware, after the monitor.
+        let full = vol(&[1.0, 1.0], false);
+        let gain = |volume: Volume, follows| monitor_gain(Some(&volume), Some(&full), follows).unwrap().undo();
+        assert_eq!(gain(vol(&[0.4, 0.4], false), false), [1.0, 1.0]);
+        // A null sink turns its monitor down with its volume.
+        assert_eq!(gain(vol(&[0.25, 0.5], false), true), [4.0, 2.0]);
+        assert_eq!(gain(vol(&[0.5, 0.5], true), true), [0.0, 0.0]);
+        assert_eq!(monitor_gain(Some(&full), None, true), None, "no monitor volume known yet");
+    }
+
+    #[test]
+    fn a_route_volume_sets_and_saves_the_routes_props() {
+        let v = route_volume(&Route { index: 1, device: 3 }, &vol(&[0.3, 0.3], false));
+        let Value::Object(o) = &v else { panic!("not an object") };
+        assert_eq!(o.type_, spa::utils::SpaTypes::ObjectParamRoute.as_raw());
+        assert_eq!(route_of(&v), Some((1, 3, false)), "no direction given");
+        let value = |key| o.properties.iter().find(|p| p.key == key).map(|p| p.value.clone());
+        assert_eq!(value(spa_sys::SPA_PARAM_ROUTE_save), Some(Value::Bool(true)));
+        let props = value(spa_sys::SPA_PARAM_ROUTE_props).unwrap();
+        assert_eq!(props_volumes(&props).0, Some(vol(&[0.3, 0.3], false)));
     }
 
     fn props(volumes: Option<Vec<f32>>, mute: Option<bool>) -> Value {
@@ -1215,6 +1681,11 @@ mod tests {
             id: spa::param::ParamType::Props.as_raw(),
             properties,
         })
+    }
+
+    /// What the microphone's post meter does with its virtual device's Props.
+    fn volume_gain(props: &Value) -> Option<[f32; 2]> {
+        props_volumes(props).0.map(|v| v.undo())
     }
 
     #[test]
