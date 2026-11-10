@@ -185,6 +185,7 @@ entry in the `EFFECTS` table in `model.rs`, plus a place in `Direction::chain`.
     cargo test
     DISPLAY=:0 python3 tests/measure.py target/release/equalizer
     DISPLAY=:0 python3 tests/mic.py target/release/equalizer
+    DISPLAY=:0 python3 tests/memory.py target/release/equalizer
 
 The second one runs the real app with tones going to a temporary silent device. It
 compares what comes out with what the graph shows, and it needs a display and a
@@ -195,6 +196,24 @@ plays its tones into a temporary fake one. It also clicks through the Microphone
 using accessibility (AT-SPI), so it needs the Python bindings for it (`python3-gi`
 with `Atspi` 2.0), and the window must stay uncovered. Quit Equalizer before running
 either one, as only one copy can run.
+
+The fourth looks for memory leaks. It repeats what a user does again and again
+(playing music, hiding and showing the window, switching pages and tabs, turning
+Active off and on, loading presets, adding bands, plugging in a device) and fails when
+the app's memory keeps growing or its PipeWire objects aren't back to what they were.
+It uses a silent device and a fake microphone as the others do, and the same
+accessibility bindings. It takes about 25 minutes. Name one or more scenarios after
+the binary to run only those: `playback`, `hide`, `pages`, `active`, `presets` or
+`devices`. Its options:
+
+- `--long` plays for an hour in all, instead of 4 minutes.
+- `--quick` runs a tenth of each count, to try the test itself after changing it. Its
+  runs are too short to tell whether memory really grows.
+- `--limit MB` sets how much growth is allowed per 100 cycles, or per hour of
+  playback (5 by default).
+- `--wrap COMMAND` runs the app under another program, such as a heap profiler, to
+  find where a failing scenario's memory goes:
+  `tests/memory.py target/release/equalizer hide --wrap heaptrack`.
 
 ## Special recognition
 
