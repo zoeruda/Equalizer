@@ -12,6 +12,7 @@ ID=io.github.zoeruda.Equalizer
 PREFIX="$HOME/.local"
 BOX=equalizer-dev
 MIN_RUST=1.92
+MIN_PIPEWIRE=1.6.7
 PLUGIN=lsp-plugins-ladspa.so
 OS_RELEASE=/etc/os-release
 LIBS=(/usr/lib64 /usr/lib /usr/lib/*-linux-gnu)
@@ -87,6 +88,17 @@ fi
     die "PipeWire isn't running in this session, and Equalizer needs it." \
         "If your system uses PipeWire, run this from a terminal in your desktop session."
 
+# Equalizer's volume goes after the effects through filter-chain's capture.volumes,
+# which older versions ignore. The module loads in the app's own process, so what
+# matters is this system's libpipewire, not the one the app is built against.
+pipewire_version=$(pw-cli --version 2>/dev/null | sed -n 's/^Linked with libpipewire \([0-9.]*\).*/\1/p')
+if [ -n "$pipewire_version" ] &&
+    [ "$(printf '%s\n' "$MIN_PIPEWIRE" "$pipewire_version" | sort -V | head -n 1)" != "$MIN_PIPEWIRE" ]; then
+    die "Equalizer needs PipeWire $MIN_PIPEWIRE or newer, but this system has $pipewire_version." \
+        "Older versions apply Equalizer's volume before the effects instead of after them." \
+        "Update PipeWire, or use the Flatpak, which brings its own: $FLATPAK_URL"
+fi
+
 module_found=false
 ladspa_found=false
 graph_found=false
@@ -118,7 +130,7 @@ in_box() { "$@"; }
 if ! build_tools_ready; then
     is_fedora_based || die "This script can only set up the build tools on Fedora-based systems." \
         "To use it here, first install:" \
-        "  - Development packages for GTK 4.14 or newer, libadwaita 1.5 or newer, and PipeWire" \
+        "  - Development packages for GTK 4.14 or newer, libadwaita 1.5 or newer, and PipeWire $MIN_PIPEWIRE or newer" \
         "  - clang, gcc, and pkg-config" \
         "  - Rust $MIN_RUST or newer, for example from https://rustup.rs" \
         "  - LSP Plugins (lsp-plugins-ladspa)" \

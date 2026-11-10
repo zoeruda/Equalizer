@@ -12,7 +12,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 </p>
 
-> **Early release:** this is version 0.0.5, so expect rough edges and changes between versions.
+> **Early release:** this is version 0.0.6, so expect rough edges and changes between versions.
 
 ![Equalizer's graph with five bands over a live spectrum, with the effect chain in the sidebar](docs/screenshot.png)
 
@@ -30,8 +30,12 @@ Equalizer uses [PipeWire](https://pipewire.org) for routing and
 
 ## Install
 
-Equalizer runs on PipeWire. To install it,
-[download the latest Flatpak](https://github.com/zoeruda/Equalizer/releases/latest)
+Equalizer runs on PipeWire. The Flatpak brings the PipeWire parts it needs. The Arch
+package and `install.sh` use your system's PipeWire, which must be 1.6.7 or newer:
+older versions apply Equalizer's volume before the effects instead of after them.
+
+To install the Flatpak,
+[download the latest release](https://github.com/zoeruda/Equalizer/releases/latest)
 and run:
 
     flatpak install --user ./Equalizer-*-x86_64.flatpak
@@ -89,6 +93,7 @@ You need Rust 1.92 or newer, for example from [rustup](https://rustup.rs). Then 
 If you aren't using the toolbox, install these first:
 
 - Development packages for GTK 4.14 or newer, libadwaita 1.5 or newer, and PipeWire
+  1.6.7 or newer
 - clang, gcc, and pkg-config
 - LSP Plugins (`lsp-plugins-ladspa`), unless your system has `dnf`, which the script
   uses to download them
@@ -173,6 +178,7 @@ both.
 | `src/model.rs` | Settings and presets, the effect table, and how settings become plugin controls |
 | `src/dsp.rs` | Filter response curves and the spectrum analyzer |
 | `src/eq_graph.rs` | The interactive equalizer graph |
+| `src/eq_widget.rs` | The widget the equalizer graph draws in: its still parts stay on the GPU as textures, and only the spectrum is redrawn each frame |
 | `src/graphs.rs` | Shared drawing |
 | `src/app.rs` | The window, pages, and the update loop |
 

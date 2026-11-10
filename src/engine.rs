@@ -28,6 +28,11 @@ const MIC_STREAM: &str = "equalizer_mic_in";
 const VOLUME_L: &str = "volume_l";
 const VOLUME_R: &str = "volume_r";
 /// How long streams get to leave the virtual output before it's removed anyway.
+/// Applying the volume after the effects needs filter-chain's `capture.volumes`, which
+/// works from PipeWire 1.6.7. Older versions ignore it without an error, and the volume
+/// goes back to being applied before the effects.
+const MIN_PIPEWIRE: (u32, u32, u32) = (1, 6, 7);
+
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the output stays after the last stream has left. WirePlumber updates its
 /// own record of links a moment after they go, and pauses any media player that record
@@ -1036,6 +1041,29 @@ fn make_meter(
     })
 }
 
+/// The filter-chain module loads into this process, so the libpipewire the app runs
+/// with is the one that counts.
+fn warn_if_old_pipewire() {
+    // SAFETY: returns a static string owned by libpipewire.
+    let version = unsafe { std::ffi::CStr::from_ptr(pw::sys::pw_get_library_version()) }.to_string_lossy();
+    if pipewire_older_than_minimum(&version) {
+        let (a, b, c) = MIN_PIPEWIRE;
+        eprintln!(
+            "equalizer: PipeWire {version} is older than {a}.{b}.{c}, so the volume is applied before the effects instead of after them. Update PipeWire to fix this."
+        );
+    }
+}
+
+/// Whether a version like "1.6.10" is older than `MIN_PIPEWIRE`. One that can't be read
+/// isn't counted as older, as the warning would then be a guess.
+fn pipewire_older_than_minimum(version: &str) -> bool {
+    let mut parts = version.split('.').map(|p| p.trim().parse::<u32>());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => (a, b, c) < MIN_PIPEWIRE,
+        _ => false,
+    }
+}
+
 fn run(
     rx: pw::channel::Receiver<Cmd>,
     events: async_channel::Sender<Event>,
@@ -1043,6 +1071,7 @@ fn run(
     post: Arc<Mutex<Analyzer>>,
 ) -> Result<(), pw::Error> {
     pw::init();
+    warn_if_old_pipewire();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     // Inside Flatpak, only a "Manager" can route audio and change the default device.
     // On the context so that it also covers the filter-chain module's own connection.
@@ -1552,6 +1581,18 @@ fn run(
 mod tests {
     use super::*;
     use crate::model::{Sound, plugin_controls};
+
+    #[test]
+    fn pipewire_before_1_6_7_is_too_old_for_the_volume_after_the_effects() {
+        assert!(pipewire_older_than_minimum("1.6.6"));
+        assert!(pipewire_older_than_minimum("1.4.9"));
+        assert!(pipewire_older_than_minimum("0.3.81"));
+        assert!(!pipewire_older_than_minimum("1.6.7"));
+        assert!(!pipewire_older_than_minimum("1.6.10"), "compared as numbers, not text");
+        assert!(!pipewire_older_than_minimum("2.0.0"));
+        assert!(!pipewire_older_than_minimum("1.7"), "unreadable, so not counted as older");
+        assert!(!pipewire_older_than_minimum("something"));
+    }
 
     #[test]
     fn args_route_the_chain_in_order() {

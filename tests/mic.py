@@ -367,7 +367,7 @@ def chain(enabled, device):
 
 
 class App:
-    def __init__(self, mutate=None, mic_on=True, output_on=False):
+    def __init__(self, mutate=None, mic_on=True, output_on=False, hidden=False):
         if not node_exists(FAKE_MIC):
             raise RuntimeError("the fake microphone is gone, so the app could open the real one")
         if output_on and not node_exists(SILENT):
@@ -383,7 +383,8 @@ class App:
         self.state_path = os.path.join(cfg, "state.json")
         json.dump(state, open(self.state_path, "w"))
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
-        self.p = subprocess.Popen([BIN], env=env, stderr=subprocess.DEVNULL)
+        # --background starts with the window hidden, as at login.
+        self.p = subprocess.Popen([BIN] + (["--background"] if hidden else []), env=env, stderr=subprocess.DEVNULL)
         self.volume = None
         if wait_for(lambda: self.p.poll() is not None, timeout=1.0):
             raise RuntimeError("the app exited right away: is another copy running?")
@@ -473,6 +474,25 @@ def sound_tests():
         peak = peak_db(os.path.join(tmp, "out.wav"))
         report(-16 < peak <= -11.8, f"ceiling -12: a -3 dB tone peaks at {peak:+.2f} dB")
         check("ceiling -12: a -24 dB tone is untouched", measure(1000, db=-24.0), -24.0)
+
+    print("With the window hidden, running in the background")
+    bell = band("Bell", 1000.0, 9.0, 1.4)
+
+    def eq_and_limiter(sound):
+        sound["bands"] = [bell]
+        effect("limiter", threshold=-12.0)(sound)
+
+    with App(eq_and_limiter, hidden=True):
+        # -30 dB comes out of the band at -21, under the limiter's ceiling.
+        check("the EQ raises a -30 dB tone by 9 dB", measure(1000, db=-30.0) + 30.0, response("Bell", 1000.0, 9.0, 1.4, 1000), tol=0.8)
+        # -10 dB would come out of the band at -1, so the limiter holds it down.
+        measure(1000, db=-10.0, seconds=1.5)
+        peak = peak_db(os.path.join(tmp, "out.wav"))
+        report(-16 < peak <= -11.8, f"the limiter holds a -10 dB tone, raised by the EQ, to {peak:+.2f} dB")
+        # The meters only run while the window shows: one of them even on the Output tab
+        # with the Output off. So none means the window really is hidden.
+        meters = run("pw-cli", "ls", "Node").count("equalizer_meter")
+        report(meters == 0, f"no level meters run while the window is hidden ({meters})")
 
 
 def preset_tests():

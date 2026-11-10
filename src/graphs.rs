@@ -48,6 +48,11 @@ pub fn panel_end(cr: &Context, w: f64, h: f64, color: Rgb) {
 /// Ends the panel's clip and clears anything drawn past its rounded corners.
 pub fn panel_trim(cr: &Context, w: f64, h: f64) {
     let _ = cr.restore();
+    trim_corners(cr, w, h);
+}
+
+/// Clears anything drawn past the panel's rounded corners.
+pub fn trim_corners(cr: &Context, w: f64, h: f64) {
     let _ = cr.save();
     cr.rectangle(0.0, 0.0, w, h);
     rounded(cr, 0.5, 0.5, w - 1.0, h - 1.0, 6.0);
@@ -122,15 +127,17 @@ pub fn smooth_levels(data: impl IntoIterator<Item = f64>, sigma: f64) -> Vec<f64
         .collect()
 }
 
+fn slope_at(ys: &[f64], i: usize) -> f64 {
+    let before = if i > 0 { ys[i] - ys[i - 1] } else { 0.0 };
+    let after = if i + 1 < ys.len() { ys[i + 1] - ys[i] } else { 0.0 };
+    dsp::curve_slope(before, after)
+}
+
 /// Continues the path with a smooth, wave-like curve through evenly spaced points.
 pub fn curve_through(cr: &Context, x0: f64, step: f64, ys: &[f64]) {
     let Some(first) = ys.first() else { return };
     cr.line_to(x0, *first);
-    let slope_at = |i: usize| {
-        let before = if i > 0 { ys[i] - ys[i - 1] } else { 0.0 };
-        let after = if i + 1 < ys.len() { ys[i + 1] - ys[i] } else { 0.0 };
-        dsp::curve_slope(before, after)
-    };
+    let slope_at = |i: usize| slope_at(ys, i);
     for i in 1..ys.len() {
         let (x1, x2) = (x0 + (i - 1) as f64 * step, x0 + i as f64 * step);
         cr.curve_to(
@@ -142,6 +149,17 @@ pub fn curve_through(cr: &Context, x0: f64, step: f64, ys: &[f64]) {
             ys[i],
         );
     }
+}
+
+/// The highest point `curve_through` can reach for these points: the curve stays
+/// within its control points.
+pub fn curve_top(ys: &[f64]) -> f64 {
+    let mut top = f64::INFINITY;
+    for i in 0..ys.len() {
+        let s = slope_at(ys, i) / 3.0;
+        top = top.min(ys[i]).min(ys[i] - s).min(ys[i] + s);
+    }
+    top
 }
 
 /// The stretches of `data` with no gap (NaN) in them, as index ranges.
@@ -406,6 +424,26 @@ mod tests {
         let (_, top, _, bottom) = cr.path_extents().expect("cairo state");
         assert!((5.0..=10.0).contains(&top), "curve reached up to {top}");
         assert!((90.0..=105.0).contains(&bottom), "curve reached down to {bottom}");
+    }
+
+    #[test]
+    fn the_top_of_a_curve_is_never_below_what_cairo_draws() {
+        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 100, 100).expect("surface");
+        for ys in [
+            vec![50.0, 10.0, 90.0, 90.0, 20.0],
+            vec![80.0, 79.0, 3.0, 80.0, 80.0, 2.0, 2.5, 60.0],
+            vec![40.0; 6],
+            (0..64).map(|i| 50.0 + 40.0 * (i as f64 * 0.9).sin()).collect(),
+        ] {
+            let cr = Context::new(&surface).expect("context");
+            curve_through(&cr, 0.0, 1.5, &ys);
+            let (_, drawn, _, _) = cr.path_extents().expect("cairo state");
+            let top = curve_top(&ys);
+            assert!(top <= drawn + 1e-9, "curve_top {top} is below the drawn top {drawn}");
+            // On steep curves the control points reach a little past the curve. That only
+            // makes the area redrawn a few pixels taller.
+            assert!(drawn - top < 8.0, "curve_top {top} is far above the drawn top {drawn}");
+        }
     }
 
     #[test]

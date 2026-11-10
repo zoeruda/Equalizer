@@ -379,13 +379,13 @@ fn spec_row(grid: &gtk::Grid, row: i32, key: &str, value: &str) -> gtk::Label {
 #[derive(Default)]
 struct Live {
     /// Each with whether it currently shows anything that moves.
-    areas: Vec<(gtk::DrawingArea, Box<dyn Fn() -> bool>)>,
+    areas: Vec<(gtk::Widget, Box<dyn Fn() -> bool>)>,
     updaters: Vec<Box<dyn Fn()>>,
 }
 
 impl Live {
-    fn add(&mut self, area: &gtk::DrawingArea) {
-        self.areas.push((area.clone(), Box::new(|| true)));
+    fn add(&mut self, area: &impl IsA<gtk::Widget>) {
+        self.areas.push((area.clone().upcast(), Box::new(|| true)));
     }
 }
 
@@ -1158,7 +1158,7 @@ fn tile(ctx: &Rc<Ctx>, dir: Direction, id: &'static str, live: &LiveRef) -> gtk:
         let ctx = ctx.clone();
         live.borrow_mut()
             .areas
-            .push((spark.clone(), Box::new(move || tile_live(&ctx, dir, id))));
+            .push((spark.clone().upcast(), Box::new(move || tile_live(&ctx, dir, id))));
     }
     let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
     texts.set_valign(gtk::Align::Center);

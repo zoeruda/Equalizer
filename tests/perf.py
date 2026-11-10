@@ -176,7 +176,9 @@ def measure(binary, state, seconds, track, workdir):
         _, ticks0, sw0 = a.get(tid, (name, 0, 0))
         cpu, wake = per.get(name, (0.0, 0.0))
         per[name] = (cpu + (ticks - ticks0) / HZ / dt * 100, wake + (sw - sw0) / dt)
-    renderer = next((l.strip() for l in open(err) if "renderer" in l.lower()), "?")
+    # With GSK_RENDERER set, GTK first says which one it's trying. "Using" is the one it got.
+    said = [l.strip() for l in open(err) if "renderer" in l.lower()]
+    renderer = next((l for l in said if l.startswith("Using renderer")), said[0] if said else "?")
     shutil.rmtree(tmp, ignore_errors=True)
     want = 0 if state == "hidden" else 2
     return {
@@ -217,6 +219,11 @@ def main():
         info = machine()
         print("Keep the Equalizer windows on screen and uncovered until this finishes.\n", flush=True)
         with Silent():
+            # The first launch after a reboot or an update reads libraries and fonts from
+            # disk and builds the GPU's shaders. Later launches reuse them. Measured, that
+            # cost about 5 points on Arch, and it always fell on OLD, which goes first.
+            print("  warming up (not measured)...", flush=True)
+            measure(builds["old"], "playing", 3, track, workdir)
             for state in states:
                 for label, binary in builds.items():
                     r = measure(binary, state, o.seconds, track, workdir)

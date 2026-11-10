@@ -4,7 +4,7 @@
 # and in the repository root that would be the app's source code.
 
 pkgname=equalizer
-pkgver=0.0.5
+pkgver=0.0.6
 pkgrel=1
 pkgdesc='A clean, simple audio equalizer for GNOME'
 arch=('x86_64')
@@ -18,7 +18,10 @@ depends=(
   'hicolor-icon-theme'
   'libadwaita'
   'libgcc'
-  'libpipewire'
+  # Equalizer's volume goes after the effects through filter-chain's capture.volumes,
+  # which older versions ignore. The "1:" is Arch's epoch for PipeWire: without it,
+  # every version would count as newer.
+  'libpipewire>=1:1.6.7'
   'lsp-plugins-ladspa'
   'pango'
   'pipewire'

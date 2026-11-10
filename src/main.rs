@@ -2,6 +2,7 @@ mod app;
 mod dsp;
 mod engine;
 mod eq_graph;
+mod eq_widget;
 mod graphs;
 mod model;
 mod theme;

@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use crate::app::Ctx;
 use crate::dsp::{self, FREQ_MAX, FREQ_MIN, SPECTRUM_COLUMNS, SPECTRUM_FLOOR};
+use crate::eq_widget::{EqWidget, Layer};
 use crate::graphs::{self, fmt_db, fmt_freq};
 use crate::model::{Band, Direction, GAIN_LIMIT};
 use crate::theme;
@@ -85,13 +86,12 @@ struct Drag {
     start_freq: f64,
 }
 
-pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
-    let area = gtk::DrawingArea::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .focusable(true)
-        .can_focus(true)
-        .build();
+pub fn build(ctx: Rc<Ctx>, dir: Direction) -> EqWidget {
+    let area = EqWidget::default();
+    area.set_hexpand(true);
+    area.set_vexpand(true);
+    area.set_focusable(true);
+    area.set_can_focus(true);
     area.set_accessible_role(gtk::AccessibleRole::Application);
     area.update_property(&[gtk::accessible::Property::Label(
         "Equalizer graph. Arrow keys change the selected band, Tab and Shift+Tab cycle through the bands, Delete removes one, and Escape leaves the graph.",
@@ -105,19 +105,20 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> gtk::DrawingArea {
 
     {
         let (ctx, hover, dragging) = (ctx.clone(), hover.clone(), dragging.clone());
-        let cache = RefCell::new(FrontCache::default());
-        area.set_draw_func(move |a, cr, w, h| {
+        let layers = RefCell::new(Layers::default());
+        area.set_snapshot_func(move |a, snapshot| {
             draw(
                 &ctx,
                 dir,
-                cr,
-                w as f64,
-                h as f64,
+                snapshot,
+                a.width() as f64,
+                a.height() as f64,
                 hover.get(),
                 dragging.borrow().is_some(),
                 a.has_focus(),
                 draw_scale(a),
-                &cache,
+                pixel_offset(a, draw_scale(a)),
+                &layers,
             );
         });
     }
@@ -284,14 +285,23 @@ fn next_band(i: usize, count: usize, back: bool) -> usize {
     if back { (i + count - 1) % count } else { (i + 1) % count }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The panel and grid behind the spectrum. They only change with the size.
+#[derive(Clone, Copy, PartialEq)]
+struct BackKey {
+    w: f64,
+    h: f64,
+    scale: f64,
+    offset: (f64, f64),
+}
+
 /// Everything that's drawn over the spectrum. It only changes with the settings or the
-/// pointer, so it's kept as an image and each frame only redraws what moves.
+/// pointer, so it's kept as a texture and each frame only redraws what moves.
 #[derive(Clone, PartialEq)]
 struct FrontKey {
     w: f64,
     full_h: f64,
     scale: f64,
+    offset: (f64, f64),
     bands: Vec<Band>,
     selected: usize,
     hover: Option<usize>,
@@ -304,46 +314,113 @@ struct FrontKey {
 }
 
 #[derive(Default)]
-struct FrontCache {
-    key: Option<FrontKey>,
-    image: Option<gtk::cairo::ImageSurface>,
+struct Layers {
+    back_key: Option<BackKey>,
+    back: Option<Layer>,
+    front_key: Option<FrontKey>,
+    front: Option<Layer>,
 }
 
-/// The scale the window is drawn at, which can be fractional, so the cached image stays sharp.
-fn draw_scale(area: &gtk::DrawingArea) -> f64 {
+/// The scale the window is drawn at, which can be fractional, so the textures stay sharp.
+fn draw_scale(area: &impl IsA<gtk::Widget>) -> f64 {
     area.native()
         .and_then(|n| n.surface())
         .map_or(area.scale_factor() as f64, |s| s.scale())
         .max(1.0)
 }
 
+/// How far into a device pixel the graph's top-left corner falls. At a fractional scale
+/// it's often between pixels, and a texture placed there would be resampled every frame.
+/// So the textures are drawn shifted by this much, and placed on whole pixels.
+fn pixel_offset(area: &impl IsA<gtk::Widget>, scale: f64) -> (f64, f64) {
+    let Some(native) = area.native() else { return (0.0, 0.0) };
+    let Some(p) = area.compute_point(&native, &gtk::graphene::Point::new(0.0, 0.0)) else {
+        return (0.0, 0.0);
+    };
+    let (sx, sy) = native.surface_transform();
+    (
+        pixel_fraction((p.x() as f64 + sx) * scale),
+        pixel_fraction((p.y() as f64 + sy) * scale),
+    )
+}
+
+/// The part of a device position past the whole pixel, rounded so that rounding errors
+/// don't make a new image.
+fn pixel_fraction(v: f64) -> f64 {
+    let f = ((v - v.floor()) * 256.0).round() / 256.0;
+    if f >= 1.0 { 0.0 } else { f }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw(
     ctx: &Ctx,
     dir: Direction,
-    cr: &gtk::cairo::Context,
+    snapshot: &gtk::Snapshot,
     w: f64,
     full_h: f64,
     hover: Option<usize>,
     dragging: bool,
     focused: bool,
     scale: f64,
-    cache: &RefCell<FrontCache>,
+    offset: (f64, f64),
+    layers: &RefCell<Layers>,
 ) {
     let h = (full_h - AXIS_H).max(40.0);
     let state = ctx.state.borrow();
     let chain = state.chain(dir);
     let sound = &chain.sound;
     let bands = &sound.bands;
-    let range = RANGE;
     let rate = ctx.rate(dir);
     let selected = ctx.selected(dir).min(bands.len().saturating_sub(1));
     let active = chain.enabled && sound.eq_enabled;
+    let mut layers = layers.borrow_mut();
+    let layers = &mut *layers;
+
+    let back = BackKey { w, h, scale, offset };
+    if layers.back_key != Some(back) {
+        layers.back = Layer::render(w, h, scale, offset, |cr| draw_back(cr, w, h));
+        layers.back_key = Some(back);
+    }
+    match &layers.back {
+        Some(layer) => layer.append(snapshot),
+        None => draw_back(&snapshot.append_cairo(&rect(0.0, 0.0, w, h)), w, h),
+    }
+
+    draw_spectrum(ctx, dir, snapshot, w, h, chain.enabled);
+
+    let front = FrontKey {
+        w,
+        full_h,
+        scale,
+        offset,
+        bands: bands.clone(),
+        selected,
+        hover,
+        dragging,
+        focused,
+        active,
+        eq_enabled: sound.eq_enabled,
+        preamp: sound.preamp,
+        rate,
+    };
+    if layers.front_key.as_ref() != Some(&front) {
+        layers.front = Layer::render(w, full_h, scale, offset, |cr| draw_front(cr, &front));
+        layers.front_key = Some(front.clone());
+    }
+    match &layers.front {
+        Some(layer) => layer.append(snapshot),
+        None => draw_front(&snapshot.append_cairo(&rect(0.0, 0.0, w, full_h)), &front),
+    }
+}
+
+fn rect(x: f64, y: f64, w: f64, h: f64) -> gtk::graphene::Rect {
+    gtk::graphene::Rect::new(x as f32, y as f32, w as f32, h as f32)
+}
+
+/// The panel and its grid: decades and 1-2-5 steps, with dB lines.
+fn draw_back(cr: &gtk::cairo::Context, w: f64, h: f64) {
     let color = theme::EQ_BLUE;
-
     graphs::panel_begin(cr, w, h);
-
-    // Grid: decades and 1-2-5 steps, with dB lines.
     graphs::seta(cr, color, 0.11);
     cr.set_line_width(1.0);
     for f in [
@@ -362,88 +439,64 @@ fn draw(
         cr.line_to(x, h);
     }
     for db in [-18.0, -12.0, -6.0, 6.0, 12.0, 18.0] {
-        let y = y_of(db, h, range).round() + 0.5;
+        let y = y_of(db, h, RANGE).round() + 0.5;
         cr.move_to(0.0, y);
         cr.line_to(w, y);
     }
     let _ = cr.stroke();
-    let zero = y_of(0.0, h, range).round() + 0.5;
+    let zero = y_of(0.0, h, RANGE).round() + 0.5;
     graphs::seta(cr, theme::TEXT, 0.32);
     cr.move_to(0.0, zero);
     cr.line_to(w, zero);
     let _ = cr.stroke();
-
-    // Live spectrum behind the curve: filled after the EQ, outline before it.
-    {
-        let rt = ctx.rt[dir as usize].borrow();
-        let y_sp = |db: f64| h - ((db - SPECTRUM_FLOOR) / -SPECTRUM_FLOOR).clamp(0.0, 1.0) * h * 0.74;
-        let step = w / SPECTRUM_COLUMNS as f64;
-        let curve = |cols: &[f64]| {
-            let ys: Vec<f64> = graphs::smooth_levels(cols.iter().copied(), SPECTRUM_BLUR)
-                .iter()
-                .map(|db| y_sp(*db))
-                .collect();
-            graphs::curve_through(cr, step / 2.0, step, &ys);
-        };
-        let cols = &rt.spectrum_post.columns;
-        if chain.enabled && cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
-            cr.move_to(0.0, h);
-            curve(cols);
-            cr.line_to(w, h);
-            cr.close_path();
-            graphs::seta(cr, color, 0.30);
-            let _ = cr.fill();
-        }
-        let cols = &rt.spectrum_pre.columns;
-        if cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5) {
-            curve(cols);
-            graphs::seta(cr, theme::TEXT, 0.20);
-            cr.set_line_width(1.0);
-            let _ = cr.stroke();
-        }
-    }
-
     graphs::panel_trim(cr, w, h);
-
-    let front = FrontKey {
-        w,
-        full_h,
-        scale,
-        bands: bands.clone(),
-        selected,
-        hover,
-        dragging,
-        focused,
-        active,
-        eq_enabled: sound.eq_enabled,
-        preamp: sound.preamp,
-        rate,
-    };
-    let mut cache = cache.borrow_mut();
-    if cache.key.as_ref() != Some(&front) {
-        cache.image = render_front(&front);
-        cache.key = Some(front.clone());
-    }
-    match &cache.image {
-        Some(image) => {
-            let _ = cr.save();
-            cr.scale(1.0 / scale, 1.0 / scale);
-            let _ = cr.set_source_surface(image, 0.0, 0.0);
-            let _ = cr.paint();
-            let _ = cr.restore();
-        }
-        None => draw_front(cr, &front),
-    }
 }
 
-fn render_front(k: &FrontKey) -> Option<gtk::cairo::ImageSurface> {
-    let (pw, ph) = ((k.w * k.scale).ceil() as i32, (k.full_h * k.scale).ceil() as i32);
-    let image = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, pw.max(1), ph.max(1)).ok()?;
-    let cr = gtk::cairo::Context::new(&image).ok()?;
-    cr.scale(k.scale, k.scale);
-    draw_front(&cr, k);
-    drop(cr);
-    Some(image)
+/// The live spectrum, behind the curve: filled after the EQ, outline before it. It's the
+/// only part that moves, so it's drawn every frame, into a cairo node only as tall as
+/// the spectrum, which is all GTK has to rasterize and upload.
+fn draw_spectrum(ctx: &Ctx, dir: Direction, snapshot: &gtk::Snapshot, w: f64, h: f64, enabled: bool) {
+    let rt = ctx.rt[dir as usize].borrow();
+    let y_sp = |db: f64| h - ((db - SPECTRUM_FLOOR) / -SPECTRUM_FLOOR).clamp(0.0, 1.0) * h * 0.74;
+    let ys = |cols: &[f64]| -> Option<Vec<f64>> {
+        cols.iter().any(|c| *c > SPECTRUM_FLOOR + 0.5).then(|| {
+            graphs::smooth_levels(cols.iter().copied(), SPECTRUM_BLUR)
+                .iter()
+                .map(|db| y_sp(*db))
+                .collect()
+        })
+    };
+    let post = if enabled { ys(&rt.spectrum_post.columns) } else { None };
+    let pre = ys(&rt.spectrum_pre.columns);
+    drop(rt);
+    let top = post
+        .iter()
+        .chain(&pre)
+        .map(|ys| graphs::curve_top(ys))
+        .fold(f64::INFINITY, f64::min);
+    // Room for the outline's width and its antialiasing.
+    let top = (top - 2.0).floor().max(0.0);
+    if top >= h {
+        // Nothing to draw (top is infinite with no spectrum).
+        return;
+    }
+    let cr = snapshot.append_cairo(&rect(0.0, top, w, h - top));
+    let step = w / SPECTRUM_COLUMNS as f64;
+    if let Some(ys) = &post {
+        cr.move_to(0.0, h);
+        graphs::curve_through(&cr, step / 2.0, step, ys);
+        cr.line_to(w, h);
+        cr.close_path();
+        graphs::seta(&cr, theme::EQ_BLUE, 0.30);
+        let _ = cr.fill();
+    }
+    if let Some(ys) = &pre {
+        graphs::curve_through(&cr, step / 2.0, step, ys);
+        graphs::seta(&cr, theme::TEXT, 0.20);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    }
+    graphs::trim_corners(&cr, w, h);
 }
 
 fn draw_front(cr: &gtk::cairo::Context, k: &FrontKey) {
@@ -592,6 +645,17 @@ fn draw_front(cr: &gtk::cairo::Context, k: &FrontKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cached_image_lines_up_with_whole_device_pixels() {
+        assert_eq!(pixel_fraction(600.0), 0.0);
+        assert_eq!(pixel_fraction(568.75), 0.75);
+        assert_eq!(pixel_fraction(1_219.5), 0.5);
+        // Rounding errors in the position don't count as a new offset.
+        assert_eq!(pixel_fraction(1_219.749_999_9), 0.75);
+        assert_eq!(pixel_fraction(599.999_999_9), 0.0);
+        assert_eq!(pixel_fraction(600.000_000_1), 0.0);
+    }
 
     #[test]
     fn tab_cycles_through_the_bands_in_both_directions() {
