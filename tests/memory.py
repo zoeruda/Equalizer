@@ -2,12 +2,13 @@
 """Looks for memory leaks: runs the real app through what a user does again and again,
 and checks that its memory and its PipeWire objects don't grow.
 
-Usage: tests/memory.py BINARY [SCENARIO ...] [--long] [--quick] [--limit MB] [--wrap COMMAND]
+Usage: tests/memory.py BINARY [SCENARIO ...] [--long] [--minutes N] [--eq-only] [--quick] [--limit MB] [--wrap COMMAND]
 
 Scenarios, all of them when none is named:
 
   playback  music playing, the window on the Equalizer page, then on an effect page:
-            2 minutes each, or 30 minutes each (an hour in all) with --long
+            a 3-minute warm-up, then 2 minutes each, 30 minutes each with --long, or
+            N minutes each with --minutes N. --eq-only leaves out the effect page
   hide      hiding and showing the window, 100 times
   pages     200 switches between the Equalizer and the effect pages, then 200 between
             the Output and Microphone tabs
@@ -17,12 +18,22 @@ Scenarios, all of them when none is named:
   devices   adding and removing a device, 30 times
 
 Each scenario starts with a warm-up that isn't counted, so caches and the first
-allocations don't count as growth. After it, the app's memory (PSS, from
-/proc/PID/smaps_rollup) is sampled and a line is fitted to it. A scenario fails when that
-line grows more than --limit MB (5 by default) per 100 cycles, or per hour of playback.
-It also fails when the app's PipeWire objects (its nodes, their ports, and their links)
-aren't back to what they were before it: a meter stream left behind is both a leak and
-the kind of bug that leaves the microphone in use.
+allocations don't count as growth. Playback's is 3 minutes: on Arch with an Intel Arc,
+the app's memory jumps 13-15 MB once in the first 2 minutes of playing, with either
+renderer, then stays flat, and a line fitted over that jump would look like a leak. After it, the app's memory is sampled and a line is
+fitted to it. A scenario fails when that line grows more than --limit MB (5 by default)
+per 100 cycles, or per hour of playback. It's judged on the app's private memory
+(Private_Clean + Private_Dirty, from /proc/PID/smaps_rollup): the memory only it holds,
+which other apps starting or quitting can't move, as they move PSS. PSS and RSS are
+shown next to it. It also fails when the app's PipeWire objects (its nodes, their ports,
+and their links) aren't back to what they were before it: a meter stream left behind is
+both a leak and the kind of bug that leaves the microphone in use.
+
+Every reading (the time or cycle, private memory, PSS, RSS and swap) is saved to
+~/equalizer-memory-report-DATE-TIME.json, with each scenario's result, so the shape of
+the growth can be seen and not only its slope. Playback's warm-up readings are saved
+too, marked "warm_up", with negative hours. It's saved even when the run stops. With
+GSK_DEBUG=renderer, it also holds the renderer GTK used.
 
 It uses a fresh temporary config and never reaches your speakers or your microphone:
 the Output plays through a temporary silent device, and the Microphone records a fake
@@ -32,14 +43,15 @@ other apps' sound goes silent. The defaults are put back afterwards.
 
 The window opens on screen and is driven through accessibility (AT-SPI). Keep it on
 screen and uncovered: a covered window stops its meters, and the run is invalid.
-Quit Equalizer first, as only one copy can run. Takes about 25 minutes, or about 85
+Quit Equalizer first, as only one copy can run. Takes about 30 minutes, or about 90
 with --long. --quick runs a tenth of each count, to try the test itself after changing
-it: its runs are too short to tell whether memory really grows.
+it: its runs are too short to tell whether memory really grows, so it shows the numbers
+as not judged, and only checks the PipeWire objects.
 
 When a scenario fails, run it alone under a heap profiler to find the source, for
 example: tests/memory.py BINARY hide --wrap heaptrack
 """
-import argparse, array, json, math, os, random, re, shlex, shutil, signal, subprocess, sys, tempfile, time, wave
+import argparse, array, datetime, json, math, os, random, re, shlex, shutil, signal, subprocess, sys, tempfile, time, wave
 
 import gi
 
@@ -67,6 +79,8 @@ cfg = os.path.join(tmp, "cfg", "equalizer")
 os.makedirs(cfg)
 fails = []
 results = []
+recorded = []  # each scenario's readings, for the saved report
+STARTED = time.monotonic()
 
 
 def run(*a):
@@ -230,13 +244,20 @@ def default_device(key):
 
 
 def memory(pid):
-    """PSS and RSS in MB. PSS counts shared pages in part, so it's the fairer total."""
+    """Private memory, PSS, RSS and swap, in MB. Private memory is the pages only the app
+    maps. PSS adds a share of the pages it shares, so it moves when other apps map or
+    unmap the same libraries; RSS counts them whole."""
     vals = {}
     for line in open(f"/proc/{pid}/smaps_rollup"):
         key, _, rest = line.partition(":")
-        if key in ("Pss", "Rss"):
+        if key in ("Pss", "Rss", "Private_Clean", "Private_Dirty", "Swap"):
             vals[key] = int(rest.split()[0]) / 1024
-    return vals["Pss"], vals["Rss"]
+    return {
+        "private": vals["Private_Clean"] + vals["Private_Dirty"],
+        "pss": vals["Pss"],
+        "rss": vals["Rss"],
+        "swap": vals.get("Swap", 0.0),
+    }
 
 
 def fit(points):
@@ -251,28 +272,43 @@ def fit(points):
 
 
 class Samples:
-    """Memory after the warm-up, against a count of cycles or seconds."""
+    """Memory after the warm-up, against a count of cycles or hours. Its readings go into
+    the saved report as they're taken, so a run that stops keeps them."""
 
     def __init__(self, app, name, unit, per):
         self.app, self.name, self.unit, self.per = app, name, unit, per
-        self.points, self.rss = [], []
+        self.readings = []
+        self.record = {"scenario": name, "x": "hours" if unit == "hour" else "cycles", "readings": self.readings}
+        recorded.append(self.record)
 
-    def take(self, x):
-        pss, rss = memory(self.app.pid)
-        self.points.append((x, pss))
-        self.rss.append(rss)
+    def take(self, x, warm_up=False):
+        m = memory(self.app.pid)
+        reading = {"x": round(x, 6), "t": round(time.monotonic() - STARTED, 1), **{k: round(v, 3) for k, v in m.items()}}
+        if warm_up:
+            reading["warm_up"] = True
+        self.readings.append(reading)
 
     def judge(self, limit):
-        growth = fit(self.points) * self.per
-        first, last = self.points[0][1], self.points[-1][1]
-        span = self.points[-1][0] - self.points[0][0]
+        judged = [r for r in self.readings if not r.get("warm_up")]
+        points = lambda key: [(r["x"], r[key]) for r in judged]
+        growth = {key: fit(points(key)) * self.per for key in ("private", "pss", "rss")}
+        first, last = judged[0], judged[-1]
+        span = last["x"] - first["x"]
         span = f"{span * 60:.0f} minutes" if self.unit == "hour" else f"{span:g} {self.unit}"
-        report(
-            growth <= limit,
-            f"{self.name}: PSS {first:.1f} → {last:.1f} MB over {span}, "
-            f"{growth:+.2f} MB per {self.per:g} {self.unit} (limit {limit:g}). RSS {self.rss[0]:.0f} → {self.rss[-1]:.0f} MB",
+        text = (
+            f"{self.name}: private {first['private']:.1f} → {last['private']:.1f} MB over {span}, "
+            f"{growth['private']:+.2f} MB per {self.per:g} {self.unit} (limit {limit:g}). "
+            f"PSS {first['pss']:.1f} → {last['pss']:.1f}, RSS {first['rss']:.0f} → {last['rss']:.0f} MB"
         )
-        results.append((self.name, first, last, growth, self.per, self.unit))
+        # --quick's runs are too short to tell a leak from the app settling.
+        if QUICK:
+            print(f"  --   {text}, not judged (--quick)", flush=True)
+        else:
+            report(growth["private"] <= limit, text)
+        verdict = "not judged" if QUICK else "ok" if growth["private"] <= limit else "FAIL"
+        per = f"MB per {self.per:g} {self.unit}"
+        self.record.update(growth={k: round(v, 3) for k, v in growth.items()}, growth_unit=per, limit=limit, verdict=verdict)
+        results.append((self.name, first["private"], last["private"], growth["private"], per, verdict))
 
 
 # ---- The window, through accessibility ----
@@ -485,9 +521,10 @@ class App:
         for name in (SILENT, FAKE_MIC, FAKE_IN):
             if not node_exists(name):
                 raise RuntimeError(f"{name} is gone, so the app could reach a real device")
+        # The bands aren't any preset's, so they're named as the app names an edited sound.
         state = {
-            "output": {"enabled": True, "device": SILENT, "preset": "Flat", "sound": sound(OUTPUT_EFFECTS, ["compressor", "limiter"])},
-            "mic": {"enabled": True, "device": FAKE_MIC, "preset": "Flat", "sound": sound(MIC_EFFECTS, ["gate", "compressor"])},
+            "output": {"enabled": True, "device": SILENT, "preset": "Custom", "sound": sound(OUTPUT_EFFECTS, ["compressor", "limiter"])},
+            "mic": {"enabled": True, "device": FAKE_MIC, "preset": "Custom", "sound": sound(MIC_EFFECTS, ["gate", "compressor"])},
             "run_in_background": True,
             "autostart": False,
         }
@@ -585,16 +622,26 @@ def settle(app):
 
 
 def playback(app, o):
-    minutes = 30 if o.long else 0.5 if QUICK else 2
-    print(f"Playback: {minutes} minutes on each page, the window showing", flush=True)
+    warm_up = 10 if QUICK else 180
+    minutes = o.minutes if o.minutes else 30 if o.long else 0.5 if QUICK else 2
+    length = f"{warm_up / 60:g}-minute" if warm_up >= 60 else f"{warm_up}-second"
+    print(f"Playback: a {length} warm-up, then {minutes:g} minutes on each page, the window showing", flush=True)
     win = app.win
-    for title, tab, row in [("the Equalizer page", "Output", EQ_ROW), ("the Compressor page", "Output", 1)]:
+    pages = [("the Equalizer page", "Output", EQ_ROW), ("the Compressor page", "Output", 1)]
+    for title, tab, row in pages[:1] if o.eq_only else pages:
         win.tab(tab)
         win.page(row)
-        sleep(10 if QUICK else 30)  # the warm-up: a level graph holds a minute, but fills from the first sample
-        before = app.objects()
         s = Samples(app, f"playback, {title}", "hour", 1)
-        t0 = time.monotonic()
+        # The warm-up, sampled but not judged. Its readings get negative hours. On Arch
+        # with an Intel Arc, memory jumps 13-15 MB once in the first 2 minutes, with
+        # Vulkan or GL, and with 0.0.5's graph too, then stays flat: the renderer's and
+        # the driver's caches filling, not a leak.
+        t0 = time.monotonic() + warm_up
+        while time.monotonic() < t0:
+            app.alive()
+            s.take((time.monotonic() - t0) / 3600, warm_up=True)
+            sleep(min(5, max(0, t0 - time.monotonic())))
+        before = app.objects()
         end = t0 + minutes * 60
         while time.monotonic() < end:
             app.alive()
@@ -791,15 +838,40 @@ def devices(app, o):
 SCENARIOS = {"playback": playback, "hide": hide, "pages": pages, "active": active, "presets": presets, "devices": devices}
 
 
+def save_report(path, stamp, binary, chosen, o, renderers):
+    """Every reading, with what the run was, so runs on different machines compare."""
+    report = {
+        "started": stamp,
+        "finished": datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "binary": binary,
+        "scenarios": chosen,
+        "options": {"long": o.long, "minutes": o.minutes, "eq_only": o.eq_only, "quick": o.quick, "limit": o.limit, "wrap": o.wrap},
+        "environment": {k: os.environ[k] for k in ("GSK_RENDERER", "GSK_DEBUG", "GDK_BACKEND", "GDK_SCALE", "XDG_SESSION_TYPE") if k in os.environ},
+        "renderer_used": renderers or "unknown (set GSK_DEBUG=renderer to record it)",
+        "units": "MB; x is cycles, or hours of playback; t is seconds since the test started",
+        "results": recorded,
+        "failed": fails,
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(report, f, indent=1)
+    except OSError as e:
+        print(f"\nCouldn't save the readings to {path}: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], usage=__doc__.split("\n\n")[1].split(": ", 1)[1])
     ap.add_argument("binary")
     ap.add_argument("scenarios", nargs="*", metavar="SCENARIO")
-    ap.add_argument("--long", action="store_true", help="play for an hour in all, instead of 4 minutes")
-    ap.add_argument("--limit", type=float, default=5.0, help="growth allowed, in MB per 100 cycles or per hour (default 5)")
-    ap.add_argument("--quick", action="store_true", help="a tenth of each count, to try the test itself: too short to judge a leak")
+    ap.add_argument("--long", action="store_true", help="play for 30 minutes on each page after the warm-up, instead of 2")
+    ap.add_argument("--minutes", type=float, help="play for this many minutes on each page after the warm-up (overrides --long and --quick)")
+    ap.add_argument("--eq-only", action="store_true", help="play on the Equalizer page only, not then on the Compressor page")
+    ap.add_argument("--limit", type=float, default=5.0, help="growth of private memory allowed, in MB per 100 cycles or per hour (default 5)")
+    ap.add_argument("--quick", action="store_true", help="a tenth of each count, to try the test itself: too short to judge a leak, so it doesn't")
     ap.add_argument("--wrap", default="", help="a command to run the app under, such as heaptrack")
     o = ap.parse_args()
+    if o.minutes is not None and o.minutes <= 0:
+        ap.error("--minutes must be more than 0")
     global QUICK
     QUICK = o.quick
     for name in o.scenarios:
@@ -828,6 +900,8 @@ def main():
         stderr=subprocess.DEVNULL,
     )
     app = None
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    saved_to = os.path.expanduser(f"~/equalizer-memory-report-{stamp}.json")
     try:
         if not wait_for(lambda: node_exists(FAKE_MIC) and node_exists(FAKE_IN) and node_exists(SILENT), timeout=5):
             sys.exit("couldn't create the fake microphone and the silent device")
@@ -837,7 +911,8 @@ def main():
         print("Keep the Equalizer window on screen and uncovered until this finishes.\n", flush=True)
         app = App(binary, o.wrap, track)
         objs = app.objects()
-        print(f"Started: {describe(objs)}, PSS {memory(app.pid)[0]:.1f} MB\n", flush=True)
+        m = memory(app.pid)
+        print(f"Started: {describe(objs)}, private {m['private']:.1f} MB, PSS {m['pss']:.1f} MB\n", flush=True)
         for name in chosen:
             try:
                 SCENARIOS[name](app, o)
@@ -846,11 +921,18 @@ def main():
                 app.alive()
     except RuntimeError as e:
         report(False, f"stopped: {e}")
+    except KeyboardInterrupt:
+        # The readings so far are still saved.
+        report(False, "stopped: interrupted")
     finally:
+        renderers = []
         if app:
             app.close()
-            if fails and os.path.getsize(app.err):
-                print("\nThe app's messages:\n" + open(app.err).read()[-3000:])
+            messages = open(app.err, errors="replace").read()
+            # GTK says which renderer it used for each surface with GSK_DEBUG=renderer.
+            renderers = sorted(set(re.findall(r"Using renderer '?(\w+)", messages)))
+            if fails and messages:
+                print("\nThe app's messages:\n" + messages[-3000:])
         loopback.terminate()
         loopback.wait()
         if silent:
@@ -866,12 +948,16 @@ def main():
                     run("pw-metadata", "-n", "default", "-d", "0", key)
                 print(f"  note: the test put {key} back")
         shutil.rmtree(tmp, ignore_errors=True)
+        if recorded:
+            save_report(saved_to, stamp, binary, chosen, o, renderers)
 
     if results:
         print("\n=== Results to paste ===")
-        print(f"{'scenario':<40} {'PSS start':>9} {'PSS end':>9} {'growth':>10}")
-        for name, first, last, growth, per, unit in results:
-            print(f"{name:<40} {first:8.1f}M {last:8.1f}M {growth:+8.2f}M per {per:g} {unit}")
+        print(f"{'scenario':<40} {'private start':>13} {'private end':>11}  growth")
+        for name, first, last, growth, per, verdict in results:
+            print(f"{name:<40} {first:12.1f}M {last:10.1f}M  {growth:+.2f} {per}{', not judged' if verdict == 'not judged' else ''}")
+    if recorded:
+        print(f"\nReadings saved to {saved_to}")
     print(f"\n{len(fails)} failed" if fails else "\nAll passed")
     sys.exit(1 if fails else 0)
 
