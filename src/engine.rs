@@ -529,8 +529,63 @@ fn streams_to_move(links: &HashMap<u32, LinkEnds>, nodes: &HashMap<u32, NodeInfo
     streams
 }
 
+/// Watches a filter-chain module, which removes itself when its device is destroyed by
+/// another program or its connection to PipeWire breaks. The app's pointer to it is
+/// then no longer usable.
+struct ModuleWatch {
+    hook: spa_sys::spa_hook,
+    /// Set once the module is being destroyed, by the app or by itself.
+    gone: Cell<bool>,
+    /// Set when the app destroys the module, so that isn't reported.
+    expected: Cell<bool>,
+    dir: Direction,
+    events: async_channel::Sender<Event>,
+}
+
+static MODULE_EVENTS: pw_sys::pw_impl_module_events = pw_sys::pw_impl_module_events {
+    version: pw_sys::PW_VERSION_IMPL_MODULE_EVENTS,
+    destroy: Some(module_destroyed),
+    free: None,
+    initialized: None,
+    registered: None,
+};
+
+unsafe extern "C" fn module_destroyed(data: *mut std::ffi::c_void) {
+    // SAFETY: `data` is the watch given to pw_impl_module_add_listener in `watch_module`,
+    // which stays allocated until `Inner::unload` frees it, after the module has gone.
+    let watch = unsafe { &*data.cast::<ModuleWatch>() };
+    watch.gone.set(true);
+    if !watch.expected.get() {
+        let what = match watch.dir {
+            Direction::Output => "device",
+            Direction::Mic => "microphone",
+        };
+        let message = format!("PipeWire removed Equalizer's {what}, so it's off now");
+        let _ = watch.events.try_send(Event::Error(message));
+        let _ = watch.events.try_send(Event::TurnedOffExternally(watch.dir));
+    }
+}
+
+/// Starts watching a module that was just loaded. The result is freed in `Inner::unload`.
+fn watch_module(module: *mut pw_sys::pw_impl_module, dir: Direction, events: async_channel::Sender<Event>) -> *mut ModuleWatch {
+    let watch = Box::into_raw(Box::new(ModuleWatch {
+        // SAFETY: a hook is plain data that starts out zeroed, as in C.
+        hook: unsafe { std::mem::zeroed() },
+        gone: Cell::new(false),
+        expected: Cell::new(false),
+        dir,
+        events,
+    }));
+    // SAFETY: the module is live, the events are static, and the watch is on the heap,
+    // so the hook keeps its address for as long as the module refers to it.
+    unsafe { pw_sys::pw_impl_module_add_listener(module, &raw mut (*watch).hook, &raw const MODULE_EVENTS, watch.cast()) };
+    watch
+}
+
 struct Chain {
     module: *mut pw_sys::pw_impl_module,
+    /// Set whenever `module` is: says whether the module has removed itself.
+    watch: *mut ModuleWatch,
     wanted: Option<String>,
     hw: Option<String>,
     /// Watches the virtual device's volume. Declared before `control`, so that it's
@@ -554,6 +609,7 @@ impl Chain {
     fn new() -> Self {
         Self {
             module: std::ptr::null_mut(),
+            watch: std::ptr::null_mut(),
             wanted: None,
             hw: None,
             volume_listener: None,
@@ -569,6 +625,12 @@ impl Chain {
 
     fn on(&self) -> bool {
         !self.module.is_null()
+    }
+
+    /// Whether the module removed itself, leaving the chain to be cleared by `Inner::unload`.
+    fn module_gone(&self) -> bool {
+        // SAFETY: a watch that isn't null is live until `Inner::unload` frees it.
+        !self.watch.is_null() && unsafe { (*self.watch).gone.get() }
     }
 }
 
@@ -846,8 +908,19 @@ impl Inner {
         chain.pending.clear();
         chain.claim_default = false;
         chain.draining = None;
-        // SAFETY: the pointer came from pw_context_load_module and is cleared here.
-        unsafe { pw_sys::pw_impl_module_destroy(chain.module) };
+        if !chain.module_gone() {
+            // SAFETY: the watch is live while the chain is on. The module pointer came
+            // from pw_context_load_module, the module hasn't removed itself, and the
+            // pointer is cleared here.
+            unsafe {
+                (*chain.watch).expected.set(true);
+                pw_sys::pw_impl_module_destroy(chain.module);
+            }
+        }
+        // SAFETY: the watch came from Box::into_raw in `watch_module`. The module is
+        // gone either way, and dropped its hook as it went, so nothing refers to it.
+        drop(unsafe { Box::from_raw(chain.watch) });
+        chain.watch = std::ptr::null_mut();
         chain.module = std::ptr::null_mut();
         chain.hw = None;
         // Only now, as until the device is gone they could go straight back to it.
@@ -1682,6 +1755,10 @@ fn run(
                 let d = dir as usize;
                 let mut s = inner.borrow_mut();
                 let configured = s.configured[d].clone().filter(|n| n != own(d));
+                // The module removed itself, and the Disable that follows hasn't come yet.
+                if s.chains[d].module_gone() {
+                    s.unload(d);
+                }
                 if s.chains[d].on() {
                     // Turned back on before the old device was removed: just keep it.
                     if s.chains[d].draining.take().is_some() {
@@ -1728,6 +1805,7 @@ fn run(
                     return;
                 }
                 s.chains[d].module = module;
+                s.chains[d].watch = watch_module(module, dir, events.clone());
                 s.chains[d].hw = Some(hw);
                 s.chains[d].claim_default = true;
             }

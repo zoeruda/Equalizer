@@ -426,6 +426,35 @@ template["output"]["device"] = device_before
 run("pactl", "unload-module", ret)
 run("pactl", "unload-module", fallback)
 
+print("Equalizer's device is removed by another program")
+# PipeWire's filter-chain then removes itself. The app used to remove it a second time
+# when quitting or turning off, which crashed it.
+with App(lambda s: None) as app:
+    objs = json.loads(run("pw-dump") or "[]")
+    sink = [o["id"] for o in objs
+            if o["type"].endswith("Node") and (o.get("info") or {}).get("props", {}).get("node.name") == "equalizer_sink"]
+    run("pw-cli", "destroy", str(sink[0])) if sink else None
+    time.sleep(1.0)
+    gone = sink and "equalizer_sink" not in run("pactl", "list", "short", "sinks")
+    alive = app.p.poll() is None
+    app.p.terminate()
+    try:
+        code = app.p.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        app.p.kill()
+        code = "none (it hung)"
+    ok = gone and alive and code == 0
+    print(f"  {'ok  ' if ok else 'FAIL'} the device {'went' if gone else 'stayed'}, the app {'kept running' if alive else 'stopped'}, "
+          f"and its exit code on quitting was {code}")
+    if not ok:
+        fails.append("survives its device being removed")
+after = run("pw-metadata", "-n", "default", "0", "default.configured.audio.sink")
+if "equalizer_sink" in after:
+    fails.append("restores default after its device is removed")
+    print("  FAIL the default wasn't handed back")
+else:
+    print("  ok   the default is handed back")
+
 print("Default device")
 before = run("pw-metadata", "-n", "default", "0", "default.configured.audio.sink")
 with App(lambda s: None):
