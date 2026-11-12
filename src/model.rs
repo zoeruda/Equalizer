@@ -808,17 +808,26 @@ pub fn user_presets(dir: Direction) -> Vec<(String, Sound)> {
     user_presets_in(&presets_dir(dir))
 }
 
+/// The largest preset file that's read. The app's own are a few kilobytes.
+const MAX_PRESET_BYTES: u64 = 1024 * 1024;
+
 fn user_presets_in(folder: &Path) -> Vec<(String, Sound)> {
     let mut out = vec![];
     if let Ok(entries) = std::fs::read_dir(folder) {
         for e in entries.flatten() {
             let path = e.path();
+            // Only ordinary files of a sensible size: reading a pipe would wait forever.
+            // And only names the app could have saved, as deleting a preset finds its
+            // file again by its name.
             if path.extension().is_some_and(|x| x == "json")
-                && let (Some(stem), Ok(data)) = (path.file_stem(), std::fs::read(&path))
+                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+                && name_is_usable(name)
+                && std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MAX_PRESET_BYTES)
+                && let Ok(data) = std::fs::read(&path)
                 && let Ok(mut sound) = serde_json::from_slice::<Sound>(&data)
             {
                 sound.sanitize();
-                out.push((stem.to_string_lossy().into_owned(), sound));
+                out.push((name.to_string(), sound));
             }
         }
     }
@@ -833,10 +842,12 @@ pub fn preset_path(dir: Direction, name: &str) -> Option<PathBuf> {
 
 fn preset_path_in(folder: &Path, name: &str) -> Option<PathBuf> {
     let name = name.trim();
-    if name.is_empty() || name.contains(['/', '\\', '\0']) || name.starts_with('.') {
-        return None;
-    }
-    Some(folder.join(format!("{name}.json")))
+    name_is_usable(name).then(|| folder.join(format!("{name}.json")))
+}
+
+/// Whether a preset can have this name, as it is.
+fn name_is_usable(name: &str) -> bool {
+    !name.is_empty() && name == name.trim() && !name.contains(['/', '\\', '\0']) && !name.starts_with('.')
 }
 
 /// Saves a preset to one tab. Its name can't be one of that tab's built-in presets.
@@ -923,6 +934,25 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_presets_the_app_could_have_saved_are_listed() {
+        let cfg = TempConfig::new("listed");
+        let folder = presets_dir_in(&cfg.0, Direction::Output);
+        write_preset(&folder, "Mine", &Sound::flat());
+        // Deleting these by name would fail, or delete another preset's file.
+        write_preset(&folder, ".hidden", &Sound::flat());
+        write_preset(&folder, " Mine", &Sound::flat());
+        // Reading a pipe would wait forever for someone to write to it.
+        let pipe = std::process::Command::new("mkfifo").arg(folder.join("Pipe.json")).status();
+        assert!(pipe.is_ok_and(|s| s.success()));
+        std::fs::create_dir(folder.join("Folder.json")).unwrap();
+        let big = std::fs::File::create(folder.join("Big.json")).unwrap();
+        big.set_len(MAX_PRESET_BYTES + 1).unwrap();
+
+        let names: Vec<String> = user_presets_in(&folder).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["Mine"]);
+    }
 
     #[test]
     fn apo_import_reads_filters_and_preamp() {

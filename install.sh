@@ -161,7 +161,7 @@ rust_version=$(in_box cargo --version 2>/dev/null | awk '{print $2}') || true
 
 need_plugin=false
 if ! plugin_installed; then
-    in_box sh -c 'command -v dnf && command -v rpm2cpio && command -v cpio' >/dev/null 2>&1 ||
+    in_box sh -c 'command -v dnf && command -v rpmkeys && command -v rpm2cpio && command -v cpio' >/dev/null 2>&1 ||
         die "LSP Plugins aren't installed, and this system doesn't have the tools to download them." \
             "Install your distribution's lsp-plugins-ladspa package, then run this again."
     need_plugin=true
@@ -186,8 +186,17 @@ install -Dm644 "data/$ID.svg" "$stage/share/icons/hicolor/scalable/apps/$ID.svg"
 if "$need_plugin"; then
     mkdir -p "$stage/rpm"
     # shellcheck disable=SC2016 # Expanded by the inner shell.
-    in_box bash -c 'set -euo pipefail; cd "$1"; dnf -q download lsp-plugins-ladspa; rpm2cpio lsp-plugins-ladspa-*.rpm | cpio -idm --quiet' _ "$stage/rpm" ||
+    in_box bash -c 'set -euo pipefail; cd "$1"; dnf -q download lsp-plugins-ladspa' _ "$stage/rpm" ||
         die "Couldn't download LSP Plugins. Check your connection, or install lsp-plugins-ladspa yourself, then run this again."
+    # dnf only checks a package's signature when installing it, and this one is unpacked
+    # by hand. A package with no signature at all passes rpmkeys, without "signatures".
+    # shellcheck disable=SC2016 # Expanded by the inner shell.
+    in_box bash -c 'set -euo pipefail; cd "$1"; rpmkeys --checksig lsp-plugins-ladspa-*.rpm | grep -q "signatures OK"' _ "$stage/rpm" ||
+        die "The downloaded LSP Plugins package isn't signed by a key this system trusts, so it wasn't used." \
+            "Install lsp-plugins-ladspa yourself, then run this again."
+    # shellcheck disable=SC2016 # Expanded by the inner shell.
+    in_box bash -c 'set -euo pipefail; cd "$1"; rpm2cpio lsp-plugins-ladspa-*.rpm | cpio -idm --quiet' _ "$stage/rpm" ||
+        die "Couldn't unpack the LSP Plugins download. Install lsp-plugins-ladspa yourself, then run this again."
     downloaded=$(find "$stage/rpm" -name "$PLUGIN" | head -n 1)
     [ -n "$downloaded" ] || die "The LSP Plugins download didn't contain $PLUGIN."
     install -Dm755 "$downloaded" "$stage/lib/ladspa/$PLUGIN"

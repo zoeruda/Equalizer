@@ -1347,14 +1347,33 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
         };
     }
     std::fs::create_dir_all(path.parent().expect("has a parent"))?;
-    let exe = std::env::current_exe()?;
+    let exe = exec_quoted(&std::env::current_exe()?.to_string_lossy());
     std::fs::write(
         path,
         format!(
-            "[Desktop Entry]\nType=Application\nName=Equalizer\nExec=\"{}\" --background\nIcon={APP_ID}\nX-GNOME-Autostart-enabled=true\n",
-            exe.display()
+            "[Desktop Entry]\nType=Application\nName=Equalizer\nExec={exe} --background\nIcon={APP_ID}\nX-GNOME-Autostart-enabled=true\n"
         ),
     )
+}
+
+/// A program's path as one quoted argument of a desktop file's `Exec` line. The format
+/// has three layers: characters that are special inside quotes take a backslash, then
+/// every backslash is doubled as in any of the file's strings, and `%` starts a field code.
+fn exec_quoted(path: &str) -> String {
+    let mut out = String::from("\"");
+    for c in path.chars() {
+        if matches!(c, '"' | '`' | '$') {
+            out.push_str("\\\\");
+        }
+        match c {
+            '\\' => out.push_str("\\\\\\\\"),
+            '\n' => out.push_str("\\n"),
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn in_flatpak() -> bool {
@@ -1934,6 +1953,15 @@ mod tests {
         rt.history_post[3] = f64::NAN;
         rt.spectrum_pre.columns[10] = -40.0;
         assert!(!at_rest(&rt), "the spectrum is fading out");
+    }
+
+    #[test]
+    fn the_autostart_files_program_path_is_quoted() {
+        assert_eq!(exec_quoted("/usr/bin/equalizer"), r#""/usr/bin/equalizer""#);
+        assert_eq!(exec_quoted("/home/a b/equalizer"), r#""/home/a b/equalizer""#);
+        assert_eq!(exec_quoted(r#"/x/"q"/$HOME/`id`"#), r#""/x/\\"q\\"/\\$HOME/\\`id\\`""#);
+        assert_eq!(exec_quoted(r"/x/back\slash"), r#""/x/back\\\\slash""#);
+        assert_eq!(exec_quoted("/x/100%"), r#""/x/100%%""#);
     }
 
     #[test]

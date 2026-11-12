@@ -8,6 +8,11 @@ on:
 # Each job is granted only what it needs below.
 permissions: {}
 
+# One release at a time. A second run waits for the first to finish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   # Runs first, so a bad tag or version fails in seconds rather than after a full build.
   prepare:
