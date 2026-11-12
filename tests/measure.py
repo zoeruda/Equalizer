@@ -262,6 +262,105 @@ with App(lambda s: None):
         fails.append("device follows the app's volume")
     check("at 70%: through the app vs straight into the device", measure(1000) - measure(1000, into="eqmeasure"), 0.0, tol=0.3)
 
+print("Sound stays in time with the picture")
+# A player keeps the picture in step with the sound by the delay PipeWire reports. A
+# delay the chain adds without reporting it makes the picture early: about 45 ms is
+# noticeable. The Loudness Compensator's FFT mode used to add 160 ms, even when off.
+
+
+def click_delay(into):
+    """Milliseconds from a click leaving a player to it coming out of the silent device.
+    The player is linked both to `into` and to a recorder that also takes the silent
+    device's monitor, so both land in the same recording whatever the start-up timing."""
+    every = RATE // 2
+    clicks = os.path.join(tmp, "clicks.wav")
+    with wave.open(clicks, "wb") as w:
+        w.setnchannels(2), w.setsampwidth(2), w.setframerate(RATE)
+        w.writeframes(b"".join(struct.pack("<hh", s, s) for s in (16000 if i % every < 48 else 0 for i in range(RATE * 3))))
+
+    def ports(prefix, flag):
+        for _ in range(50):
+            found = sorted(p for p in run("pw-link", flag).splitlines() if p.startswith(prefix))
+            if len(found) >= 2:
+                return found
+            time.sleep(0.1)
+        return []
+
+    out = os.path.join(tmp, "clicks-out.wav")
+    rec = subprocess.Popen(["pw-record", "--target=0", "-P", "{ node.name = eqmeasure_rec }", "--rate", str(RATE), "--channels", "4",
+                            "--channel-map", "AUX0,AUX1,AUX2,AUX3", "--format", "s16", out], stderr=subprocess.DEVNULL)
+    rec_in = ports("eqmeasure_rec:", "-i")
+    for s, d in zip(ports("eqmeasure:monitor_", "-o"), rec_in[2:]):
+        run("pw-link", s, d)
+    # Unlinked until linked here, so it can't play anywhere else.
+    play = subprocess.Popen(["pw-play", "--target=0", "-P", "{ node.name = eqmeasure_play node.dont-fallback = true }", clicks], stderr=subprocess.DEVNULL)
+    play_out = ports("eqmeasure_play:", "-o")
+    for s, d in zip(play_out, rec_in[:2]):
+        run("pw-link", s, d)
+    for s, d in zip(play_out, ports(f"{into}:playback_", "-i")):
+        run("pw-link", s, d)
+    play.wait()
+    time.sleep(0.4)
+    rec.send_signal(signal.SIGINT)
+    rec.wait()
+    with wave.open(out) as w:
+        raw = w.readframes(w.getnframes())
+    v = struct.unpack("<%dh" % (len(raw) // 2), raw)
+
+    def onsets(x):
+        found, i = [], 0
+        while i < len(x):
+            if abs(x[i]) > 1500:
+                found.append(i)
+                i += every // 2
+            else:
+                i += 1
+        return found
+
+    # Each click coming out is timed by its loudest sample, not its first loud one: a
+    # linear-phase filter rings before the click itself. The first click may come before
+    # every link is made.
+    came = [abs(x) for x in v[2::4]]
+    gaps = []
+    for g in onsets(v[0::4])[1:]:
+        window = came[g : g + every]
+        if window and max(window) > 1500:
+            gaps.append(window.index(max(window)))
+    gaps.sort()
+    return gaps[len(gaps) // 2] / RATE * 1000 if gaps else None
+
+
+def reported_ms(sink):
+    """The latency PipeWire reports for a device, as a Pulse client such as a browser sees it."""
+    for block in run("pactl", "list", "sinks").split("\n\n"):
+        if re.search(rf"Name: {re.escape(sink)}$", block, re.M):
+            m = re.search(r"Latency: (\d+) usec", block)
+            return int(m.group(1)) / 1000 if m else 0.0
+    return 0.0
+
+
+def with_effects(*names):
+    def mutate(s):
+        for name in names:
+            s["effects"][name]["enabled"] = True
+    return mutate
+
+
+# Loudness off matters most: the plugin keeps its delay when bypassed.
+for label, mutate in [("the defaults (limiter on)", with_effects("limiter")), ("loudness and limiter on", with_effects("loudness", "limiter"))]:
+    with App(mutate):
+        straight, through = click_delay("eqmeasure"), click_delay("equalizer_sink")
+        if straight is None or through is None:
+            print(f"  FAIL {label}: couldn't hear the clicks")
+            fails.append(f"sound stays in time, {label}")
+            continue
+        added = through - straight
+        unreported = added - (reported_ms("equalizer_sink") - reported_ms("eqmeasure"))
+        ok = unreported <= 20
+        print(f"  {'ok  ' if ok else 'FAIL'} {label}: the app adds {added:.1f} ms, {unreported:.1f} ms of it not reported (at most 20)")
+        if not ok:
+            fails.append(f"sound stays in time, {label}")
+
 print("Bluetooth headphones' late volume reports")
 # After a volume change, Bluetooth headphones report the volume they had once more, a
 # few milliseconds later, then confirm the new one. The app used to take the old one

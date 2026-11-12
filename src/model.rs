@@ -332,7 +332,11 @@ pub static EFFECTS: &[EffectSpec] = &[
             15.0,
             Map::Loudness,
         )],
-        fixed: &[],
+        // IIR, not the default FFT. The FFT filter delays the sound by 160 ms, even when
+        // bypassed, and PipeWire doesn't tell apps, so video would be out of sync. The IIR
+        // curve is within about 1 dB at the default amount, with 3-4 dB less boost from
+        // 60 to 180 Hz at the most. Approximation 2 follows the FFT curve as well as any.
+        fixed: &[("Processing mode", 1.0), ("IIR approximation", 2.0)],
     },
     EffectSpec {
         id: "limiter",
@@ -1041,6 +1045,14 @@ mod tests {
         let m = plugin_controls(&s, Direction::Output);
         assert_eq!(m["loudness:Output volume (dB)"], -20.0);
         assert!((m["loudness:Input gain (G)"] - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn loudness_uses_its_iir_mode_which_adds_no_delay() {
+        // Bypassed too: the plugin keeps its delay when it's off.
+        let m = plugin_controls(&Sound::flat(), Direction::Output);
+        assert_eq!(m["loudness:Bypass"], 1.0);
+        assert_eq!(m["loudness:Processing mode"], 1.0);
     }
 
     #[test]
