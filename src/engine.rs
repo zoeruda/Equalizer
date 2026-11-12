@@ -10,7 +10,7 @@ use pw::spa;
 use pw::spa::pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray, deserialize::PodDeserializer, serialize::PodSerializer};
 use pw::spa::utils::dict::DictRef;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,10 @@ pub enum Event {
     Devices {
         sinks: Vec<Device>,
         sources: Vec<Device>,
+        /// Whether the Output and the Microphone use, or would use when turned on,
+        /// Bluetooth headphones that have to switch to their headset profile for it:
+        /// WirePlumber's stand-in microphone for headphones playing music.
+        headset_switch: [bool; 2],
     },
     /// The person chose a different default device in system settings.
     TurnedOffExternally(Direction),
@@ -218,6 +222,34 @@ struct NodeInfo {
     class: String,
     serial: String,
     dont_fallback: bool,
+    /// The device it belongs to, such as a sound card or Bluetooth headphones.
+    device: Option<u32>,
+}
+
+
+/// The real device a chain should use, from those there are now (in the order they're
+/// listed): the chosen one, or another one of the same device; otherwise the default
+/// from before Equalizer, or another one of its device; otherwise the current defaults;
+/// otherwise the first. Bluetooth headphones replace their output with another when they
+/// switch to their headset profile and back, and the other may not have the same name.
+fn pick_device(
+    devices: &[(String, Option<u32>)],
+    wanted: Option<&str>,
+    previous: Option<&str>,
+    defaults: [Option<&str>; 2],
+    device_of: &HashMap<String, u32>,
+) -> Option<String> {
+    let exists = |n: &str| devices.iter().any(|(d, _)| d == n);
+    let same_device = |n: &str| {
+        let device = device_of.get(n)?;
+        devices.iter().find(|(_, d)| d.as_ref() == Some(device)).map(|(name, _)| name.clone())
+    };
+    [wanted, previous]
+        .into_iter()
+        .flatten()
+        .find_map(|n| if exists(n) { Some(n.to_string()) } else { same_device(n) })
+        .or(defaults.into_iter().flatten().find(|n| exists(n)).map(str::to_string))
+        .or(devices.first().map(|(n, _)| n.clone()))
 }
 
 struct LinkEnds {
@@ -259,6 +291,10 @@ const SAME_DB: f32 = 0.05;
 const ECHO_DB: f32 = 0.75;
 /// How long a volume sent to the real device is waited for.
 const ECHO_WAIT: Duration = Duration::from_millis(1500);
+/// How long after a volume is sent to the real device it may still report the volume it
+/// had before. Bluetooth headphones do, a few milliseconds after the change, and then
+/// confirm the new one a quarter of a second later.
+const STALE_WAIT: Duration = Duration::from_millis(500);
 
 /// A volume as PipeWire's Props carry it: a linear gain per channel, and mute.
 #[derive(Clone, Debug, PartialEq)]
@@ -389,6 +425,39 @@ fn set_volume(node: &Node, v: &Volume) {
     send_param(&volume_props(v, spa::param::ParamType::Props), |pod| {
         node.set_param(spa::param::ParamType::Props, 0, pod)
     });
+}
+
+/// Props that set Equalizer's own output volume, which must never be applied to the
+/// sound. Filter-chain normally adds the soft volumes that keep it out, but only when
+/// the volume changes: given the volume it already has, it passes the volume on without
+/// them, and the volume is then applied before the effects (PipeWire 1.6.11). So they
+/// go along every time, as filter-chain would set them: full, or silent when muted.
+fn own_volume_props(v: &Volume) -> Value {
+    let Value::Object(mut obj) = volume_props(v, spa::param::ParamType::Props) else {
+        unreachable!("volume_props makes an object")
+    };
+    let soft = v.channels.iter().map(|&c| if v.mute || c == 0.0 { 0.0 } else { 1.0 }).collect();
+    obj.properties.push(prop(spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(soft))));
+    obj.properties.push(prop(spa_sys::SPA_PROP_softMute, Value::Bool(v.mute)));
+    Value::Object(obj)
+}
+
+/// A volume sent to the real device, to recognize it coming back.
+struct Sent {
+    volume: Volume,
+    /// The device's volume before, which it may still report for a moment.
+    before: Volume,
+    at: Instant,
+}
+
+/// Whether a volume the real device reports is only the result of volumes sent to it:
+/// one of them coming back, perhaps rounded to the device's steps, or the volume it had
+/// before, reported once more just after.
+fn is_echo(sent: &VecDeque<Sent>, v: &Volume, now: Instant) -> bool {
+    sent.iter().any(|s| {
+        s.volume.close(v, ECHO_DB)
+            || (now.duration_since(s.at) < STALE_WAIT && s.before.close(v, ECHO_DB))
+    })
 }
 
 struct Route {
@@ -526,7 +595,18 @@ struct Inner {
     effective: [Option<String>; 2],
     metering: Option<Direction>,
     meters: Vec<Meter>,
-    last_devices: (Vec<Device>, Vec<Device>),
+    last_devices: (Vec<Device>, Vec<Device>, [bool; 2]),
+    /// The device each real node belongs to, by node name, kept after the node goes,
+    /// to find another node of the same device.
+    device_of: HashMap<String, u32>,
+    /// Watches every microphone's full properties, by node id: the registry doesn't
+    /// pass on the one that marks WirePlumber's stand-in.
+    source_props: HashMap<u32, (pw::node::NodeListener, Node)>,
+    /// WirePlumber's stand-in microphones for Bluetooth headphones playing music, by
+    /// node id (`bluez5.loopback`). They only work once an app records and the
+    /// headphones switch to their headset profile. Headphones that don't need to
+    /// switch, such as LE Audio ones, have none.
+    stand_ins: HashSet<u32>,
     registry: pw::registry::RegistryRc,
     post: Arc<Mutex<Analyzer>>,
     real: Option<RealOutput>,
@@ -536,7 +616,10 @@ struct Inner {
     /// its own volume is only the one it started with.
     synced: bool,
     /// Volumes recently sent to the real device, to recognize them coming back.
-    sent: VecDeque<(Volume, Instant)>,
+    sent: VecDeque<Sent>,
+    /// The volume last set on Equalizer's output, until it shows there. Setting the
+    /// same one again before then would do nothing useful.
+    shown: Option<(Volume, Instant)>,
 }
 
 const DEFAULT_KEYS: [&str; 2] = ["default.configured.audio.sink", "default.configured.audio.source"];
@@ -582,19 +665,52 @@ impl Inner {
         v
     }
 
-    /// The real device a chain should use: the chosen one if it's connected,
-    /// otherwise the system default, otherwise anything available.
+    /// This direction's real devices, in the order they're listed, with the device each
+    /// belongs to.
+    fn candidates(&self, dir: usize) -> Vec<(String, Option<u32>)> {
+        self.devices(dir)
+            .into_iter()
+            .map(|d| {
+                let device = self.nodes.values().find(|n| n.name == d.name).and_then(|n| n.device);
+                (d.name, device)
+            })
+            .collect()
+    }
+
+    /// The real device a chain should use (see `pick_device`).
     fn resolve_hw(&self, dir: usize) -> Option<String> {
-        let devices = self.devices(dir);
-        let exists = |n: &String| devices.iter().any(|d| &d.name == n);
-        self.chains[dir]
-            .wanted
-            .clone()
-            .filter(exists)
-            .or(self.chains[dir].previous_default.clone().filter(exists))
-            .or(self.configured[dir].clone().filter(exists))
-            .or(self.effective[dir].clone().filter(exists))
-            .or(devices.first().map(|d| d.name.clone()))
+        let c = &self.chains[dir];
+        pick_device(
+            &self.candidates(dir),
+            c.wanted.as_deref(),
+            c.previous_default.as_deref(),
+            [self.configured[dir].as_deref(), self.effective[dir].as_deref()],
+            &self.device_of,
+        )
+    }
+
+    /// The real device a chain uses, or would use if it were turned on now.
+    fn device_in_use(&self, dir: usize) -> Option<String> {
+        let c = &self.chains[dir];
+        if c.on() {
+            return c.hw.clone();
+        }
+        pick_device(
+            &self.candidates(dir),
+            c.wanted.as_deref(),
+            None,
+            [self.configured[dir].as_deref(), self.effective[dir].as_deref()],
+            &self.device_of,
+        )
+    }
+
+    /// Whether each direction uses, or would use when turned on, a stand-in microphone.
+    fn headset_switch(&self) -> [bool; 2] {
+        [0, 1].map(|d| {
+            self.device_in_use(d).is_some_and(|name| {
+                self.nodes.iter().any(|(id, n)| n.name == name && self.stand_ins.contains(id))
+            })
+        })
     }
 
     fn set_default(&self, dir: usize, name: Option<&str>) {
@@ -627,12 +743,11 @@ impl Inner {
     /// Shows a change to the real device's volume, made anywhere, on Equalizer's output.
     fn follow_real(&mut self) {
         let now = Instant::now();
-        self.sent.retain(|(_, t)| now.duration_since(*t) < ECHO_WAIT);
+        self.sent.retain(|s| now.duration_since(s.at) < ECHO_WAIT);
         let Some(v) = self.real.as_ref().and_then(|r| r.volume.clone()) else {
             return;
         };
-        // Our own change coming back, perhaps rounded to the hardware's steps.
-        if self.sent.iter().any(|(x, _)| x.close(&v, ECHO_DB)) {
+        if is_echo(&self.sent, &v, now) {
             return;
         }
         let shown = v.for_channels(2);
@@ -640,16 +755,33 @@ impl Inner {
             self.synced = true;
             return;
         }
+        self.show_volume(shown);
+    }
+
+    /// Sets Equalizer's output volume, to show the real device's.
+    fn show_volume(&mut self, v: Volume) {
+        let now = Instant::now();
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|(s, at)| s.close(&v, SAME_DB) && now.duration_since(*at) < ECHO_WAIT)
+        {
+            return;
+        }
         if let Some(node) = &self.chains[0].control {
-            set_volume(node, &shown);
+            send_param(&own_volume_props(&v), |pod| node.set_param(spa::param::ParamType::Props, 0, pod));
+            self.shown = Some((v, now));
         }
     }
 
     /// Passes a change to Equalizer's output volume on to the real device.
     fn forward_volume(&mut self, v: Volume) {
+        if self.shown.as_ref().is_some_and(|(s, _)| s.close(&v, SAME_DB)) {
+            self.shown = None;
+        }
         self.sink_volume = Some(v.clone());
         let Some(real) = &self.real else { return };
-        let Some(current) = &real.volume else { return };
+        let Some(current) = real.volume.clone() else { return };
         if v.close(&current.for_channels(v.channels.len()), SAME_DB) {
             self.synced = true;
             return;
@@ -657,9 +789,7 @@ impl Inner {
         if !self.synced {
             // Equalizer's output has just appeared, at the volume it starts with. It
             // shows the real device's volume first, and only then passes changes on.
-            if let Some(node) = &self.chains[0].control {
-                set_volume(node, &current.for_channels(2));
-            }
+            self.show_volume(current.for_channels(2));
             return;
         }
         let out = v.for_channels(current.channels.len());
@@ -669,7 +799,11 @@ impl Inner {
             }),
             _ => set_volume(&real.node, &out),
         }
-        self.sent.push_back((out, Instant::now()));
+        self.sent.push_back(Sent {
+            volume: out,
+            before: current,
+            at: Instant::now(),
+        });
     }
 
     fn node_id(&self, name: &str) -> Option<u32> {
@@ -677,20 +811,23 @@ impl Inner {
     }
 
     /// Moves a running chain to another real device without restarting it.
-    fn retarget(&mut self, dir: usize) {
+    /// Moves a running chain to the real device it should use now. Returns whether it moved.
+    fn retarget(&mut self, dir: usize) -> bool {
         if !self.chains[dir].on() {
-            return;
+            return false;
         }
-        let Some(hw) = self.resolve_hw(dir) else { return };
+        let Some(hw) = self.resolve_hw(dir) else { return false };
         if self.chains[dir].hw.as_deref() == Some(&hw) {
-            return;
+            return false;
         }
         let stream = if dir == 0 { OUT_STREAM } else { MIC_STREAM };
         let serial = self.nodes.values().find(|n| n.name == hw).map(|n| n.serial.clone());
         if let (Some(id), Some(serial), Some(m)) = (self.node_id(stream), serial, &self.metadata) {
             m.set_property(id, "target.object", Some("Spa:Id"), Some(&serial));
             self.chains[dir].hw = Some(hw);
+            return true;
         }
+        false
     }
 
     fn unload(&mut self, dir: usize) {
@@ -704,6 +841,7 @@ impl Inner {
         if dir == 0 {
             self.sink_volume = None;
             self.synced = false;
+            self.shown = None;
         }
         chain.pending.clear();
         chain.claim_default = false;
@@ -833,6 +971,7 @@ fn track_real_output(inner: &Rc<RefCell<Inner>>) {
     }
     s.real = None;
     s.sent.clear();
+    s.shown = None;
     // A different device: Equalizer's output shows its volume before passing changes on.
     s.synced = false;
     s.update_post_gain();
@@ -961,6 +1100,11 @@ fn make_meter(
         "target.object" => target,
         "node.dont-reconnect" => "true",
         "node.dont-fallback" => "true",
+        // A level meter, as pavucontrol's. WirePlumber doesn't count it as an app
+        // recording: on its own it doesn't switch Bluetooth headphones to their headset
+        // profile (the Microphone's chain doesn't either, being a filter), and doesn't
+        // take part in role-based ducking.
+        "stream.monitor" => "true",
     };
     if passive {
         props.insert("node.passive", "true");
@@ -1090,13 +1234,17 @@ fn run(
         effective: [None, None],
         metering: None,
         meters: vec![],
-        last_devices: (vec![], vec![]),
+        last_devices: (vec![], vec![], [false; 2]),
+        device_of: HashMap::new(),
+        source_props: HashMap::new(),
+        stand_ins: HashSet::new(),
         registry: registry.clone(),
         post: post.clone(),
         real: None,
         sink_volume: None,
         synced: false,
         sent: VecDeque::new(),
+        shown: None,
     }));
 
     // Rebuilds the meter streams to match the current state.
@@ -1199,12 +1347,13 @@ fn run(
         let (inner, events) = (inner.clone(), events.clone());
         Rc::new(move || {
             let mut s = inner.borrow_mut();
-            let current = (s.devices(0), s.devices(1));
+            let current = (s.devices(0), s.devices(1), s.headset_switch());
             if current != s.last_devices {
                 s.last_devices = current.clone();
                 let _ = events.try_send(Event::Devices {
                     sinks: current.0,
                     sources: current.1,
+                    headset_switch: current.2,
                 });
             }
         })
@@ -1244,6 +1393,7 @@ fn run(
                             class: props.get("media.class").unwrap_or_default().to_string(),
                             serial: props.get("object.serial").unwrap_or_default().to_string(),
                             dont_fallback: matches!(props.get("node.dont-fallback"), Some("true" | "1")),
+                            device: props.get("device.id").and_then(|v| v.parse().ok()),
                             name: name.clone(),
                         };
                         let dir = if name == SINK_NAME {
@@ -1254,9 +1404,62 @@ fn run(
                             None
                         };
                         let is_real = inner.borrow().chains[0].hw.as_deref() == Some(name.as_str());
-                        inner.borrow_mut().nodes.insert(g.id, info);
-                        if is_real && dir.is_none() {
+                        let mut moved = false;
+                        {
+                            let mut s = inner.borrow_mut();
+                            if let Some(device) = info.device {
+                                s.device_of.insert(name.clone(), device);
+                            }
+                            let class = info.class.clone();
+                            s.nodes.insert(g.id, info);
+                            // A device coming back, or Bluetooth headphones' output after
+                            // a profile switch: a running chain goes back to it, as it
+                            // moved away when the device went. Only to the device it
+                            // prefers, not to any device that happens to be listed first.
+                            if dir.is_none() {
+                                for d in 0..2 {
+                                    if device_class(d, &class)
+                                        && s.chains[d].draining.is_none()
+                                        && s.resolve_hw(d).as_deref() == Some(name.as_str())
+                                    {
+                                        moved |= s.retarget(d);
+                                    }
+                                }
+                            }
+                        }
+                        if (is_real || moved) && dir.is_none() {
                             rebuild();
+                        }
+                        // Which microphones are WirePlumber's stand-ins is only in their
+                        // full properties.
+                        if dir.is_none() && device_class(1, props.get("media.class").unwrap_or_default()) {
+                            match reg.bind::<Node, _>(g) {
+                                Ok(node) => {
+                                    let (weak, send, id) = (Rc::downgrade(&inner), send_devices.clone(), g.id);
+                                    let listener = node
+                                        .add_listener_local()
+                                        .info(move |info| {
+                                            // Only an event that carries the properties says
+                                            // anything: the others, such as the microphone
+                                            // starting or stopping, come with none.
+                                            if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
+                                                return;
+                                            }
+                                            let Some(props) = info.props() else { return };
+                                            let stand_in = matches!(props.get("bluez5.loopback"), Some("true" | "1"));
+                                            let Some(inner) = weak.upgrade() else { return };
+                                            let Ok(mut s) = inner.try_borrow_mut() else { return };
+                                            let changed = if stand_in { s.stand_ins.insert(id) } else { s.stand_ins.remove(&id) };
+                                            drop(s);
+                                            if changed {
+                                                send();
+                                            }
+                                        })
+                                        .register();
+                                    inner.borrow_mut().source_props.insert(g.id, (listener, node));
+                                }
+                                Err(e) => eprintln!("equalizer: can't read the properties of a microphone: {e}"),
+                            }
                         }
                         if let Some(d) = dir {
                             let mut s = inner.borrow_mut();
@@ -1323,7 +1526,7 @@ fn run(
                                 return;
                             }
                         };
-                        let (inner2, events2) = (inner.clone(), events.clone());
+                        let (inner2, events2, send2) = (inner.clone(), events.clone(), send_devices.clone());
                         let listener = meta
                             .add_listener_local()
                             .property(move |subject, key, _type, value| {
@@ -1354,6 +1557,9 @@ fn run(
                                         s.configured[d] = name;
                                     }
                                 }
+                                drop(s);
+                                // A new default can be a Bluetooth device, or stop being one.
+                                send2();
                                 0
                             })
                             .register();
@@ -1368,6 +1574,11 @@ fn run(
                 if inner_rm.borrow_mut().links.remove(&id).is_some() {
                     finish_rm();
                     return;
+                }
+                {
+                    let mut s = inner_rm.borrow_mut();
+                    s.source_props.remove(&id);
+                    s.stand_ins.remove(&id);
                 }
                 let removed = inner_rm.borrow_mut().nodes.remove(&id);
                 let Some(removed) = removed else { return };
@@ -1453,14 +1664,15 @@ fn run(
     };
 
     let _receiver = {
-        let (inner, context, rebuild, events, finish) = (
+        let (inner, context, rebuild, events, finish, send) = (
             inner.clone(),
             context.clone(),
             rebuild_meters.clone(),
             events.clone(),
             finish_drains.clone(),
+            send_devices.clone(),
         );
-        rx.attach(mainloop.loop_(), move |cmd| match cmd {
+        let handle = move |cmd| match cmd {
             Cmd::Enable {
                 dir,
                 device,
@@ -1570,6 +1782,12 @@ fn run(
                 drop(s);
                 finish();
             }
+        };
+        // Turning a chain on or off, or choosing its device, can change whether it uses
+        // a Bluetooth device.
+        rx.attach(mainloop.loop_(), move |cmd| {
+            handle(cmd);
+            send();
         })
     };
     mainloop.run();
@@ -1701,6 +1919,53 @@ mod tests {
         assert_eq!(props_volumes(&props).0, Some(vol(&[0.3, 0.3], false)));
     }
 
+    fn soft_volumes(v: &Value) -> (Option<Vec<f32>>, Option<bool>) {
+        let Value::Object(o) = v else { panic!("not an object") };
+        let value = |key| o.properties.iter().find(|p| p.key == key).map(|p| p.value.clone());
+        let soft = match value(spa_sys::SPA_PROP_softVolumes) {
+            Some(Value::ValueArray(ValueArray::Float(f))) => Some(f),
+            _ => None,
+        };
+        let mute = match value(spa_sys::SPA_PROP_softMute) {
+            Some(Value::Bool(b)) => Some(b),
+            _ => None,
+        };
+        (soft, mute)
+    }
+
+    #[test]
+    fn equalizers_own_volume_is_kept_out_of_the_sound_every_time() {
+        // Without these, filter-chain applies a volume it's given twice before the effects.
+        let v = own_volume_props(&vol(&[0.27, 0.27], false));
+        assert_eq!(props_volumes(&v).0, Some(vol(&[0.27, 0.27], false)));
+        assert_eq!(soft_volumes(&v), (Some(vec![1.0, 1.0]), Some(false)));
+        // As filter-chain sets them itself: muted, or at zero, is silent.
+        assert_eq!(soft_volumes(&own_volume_props(&vol(&[0.27, 0.27], true))), (Some(vec![0.0, 0.0]), Some(true)));
+        assert_eq!(soft_volumes(&own_volume_props(&vol(&[0.0, 0.5], false))), (Some(vec![0.0, 1.0]), Some(false)));
+        // The real device's volume is applied however its node does it, so it has none.
+        assert_eq!(soft_volumes(&volume_props(&vol(&[0.27, 0.27], false), spa::param::ParamType::Props)), (None, None));
+    }
+
+    #[test]
+    fn the_devices_reports_after_a_change_are_echoes() {
+        let start = Instant::now();
+        let sent = VecDeque::from([Sent {
+            volume: vol(&[0.343, 0.343], false),
+            before: vol(&[0.279, 0.279], false),
+            at: start,
+        }]);
+        let soon = start + Duration::from_millis(10);
+        // The change coming back, rounded to the headphones' steps.
+        assert!(is_echo(&sent, &vol(&[0.34416, 0.34416], false), start + Duration::from_millis(230)));
+        // The volume it had before, reported once more just after.
+        assert!(is_echo(&sent, &vol(&[0.279, 0.279], false), soon));
+        // Later, going back to it is a real change, made on the device.
+        assert!(!is_echo(&sent, &vol(&[0.279, 0.279], false), start + STALE_WAIT));
+        // Any other volume is a real change.
+        assert!(!is_echo(&sent, &vol(&[0.125, 0.125], false), soon));
+        assert!(!is_echo(&sent, &vol(&[0.343, 0.343], true), soon));
+    }
+
     fn props(volumes: Option<Vec<f32>>, mute: Option<bool>) -> Value {
         let mut properties = vec![];
         let mut add = |key, value| {
@@ -1826,6 +2091,44 @@ mod tests {
         assert!(drain.ready(start + DRAIN_TIMEOUT, true));
     }
 
+    fn listed(devices: &[(&str, Option<u32>)]) -> Vec<(String, Option<u32>)> {
+        devices.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    }
+
+    #[test]
+    fn a_chain_uses_the_chosen_device_then_the_old_default_then_the_current_ones() {
+        let none = HashMap::new();
+        let devices = listed(&[("builtin", Some(1)), ("hdmi", Some(2)), ("usb", Some(3))]);
+        let pick = |w, p, c, e| pick_device(&devices, w, p, [c, e], &none);
+        assert_eq!(pick(Some("usb"), Some("hdmi"), None, None).as_deref(), Some("usb"));
+        assert_eq!(pick(Some("gone"), Some("hdmi"), None, None).as_deref(), Some("hdmi"));
+        assert_eq!(pick(None, Some("gone"), Some("usb"), Some("hdmi")).as_deref(), Some("usb"));
+        assert_eq!(pick(None, None, Some("gone"), Some("hdmi")).as_deref(), Some("hdmi"));
+        assert_eq!(pick(None, None, None, None).as_deref(), Some("builtin"));
+        assert_eq!(pick_device(&[], Some("usb"), None, [None, None], &none), None);
+    }
+
+    #[test]
+    fn a_chain_stays_with_bluetooth_headphones_when_they_switch_profile() {
+        // The A2DP output is gone; the headset output of the same headphones is there,
+        // under another name.
+        let devices = listed(&[("builtin", Some(1)), ("bluez_output.hfp", Some(74))]);
+        let device_of = HashMap::from([("bluez_output.a2dp".to_string(), 74), ("builtin".to_string(), 1)]);
+        let pick = |w, p| pick_device(&devices, w, p, [None, None], &device_of);
+        // The default from before Equalizer...
+        assert_eq!(pick(None, Some("bluez_output.a2dp")).as_deref(), Some("bluez_output.hfp"));
+        // ...or the chosen device, which comes before another default that's still there.
+        assert_eq!(pick(Some("bluez_output.a2dp"), Some("builtin")).as_deref(), Some("bluez_output.hfp"));
+        // Back in A2DP, its own output again.
+        let back = listed(&[("bluez_output.a2dp", Some(74)), ("bluez_output.hfp", Some(74)), ("builtin", Some(1))]);
+        assert_eq!(
+            pick_device(&back, Some("bluez_output.a2dp"), None, [None, None], &device_of).as_deref(),
+            Some("bluez_output.a2dp")
+        );
+        // A device never seen gives no hint.
+        assert_eq!(pick(Some("unknown"), None).as_deref(), Some("builtin"));
+    }
+
     #[test]
     fn a_device_is_only_handed_back_if_it_still_exists() {
         let device = |name: &str| Device {
@@ -1846,6 +2149,7 @@ mod tests {
             class: class.to_string(),
             serial: String::new(),
             dont_fallback,
+            device: None,
         };
         let nodes = HashMap::from([
             (1, node("Audio/Sink", false)),

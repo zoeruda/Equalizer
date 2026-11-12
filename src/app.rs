@@ -1225,7 +1225,7 @@ fn chain_page(
     dir: Direction,
     split_toggle: &gtk::ToggleButton,
     live: &LiveRef,
-) -> (adw::OverlaySplitView, gtk::DropDown) {
+) -> (adw::OverlaySplitView, gtk::DropDown, gtk::Box) {
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .transition_duration(120)
@@ -1279,6 +1279,8 @@ fn chain_page(
     let devices = gtk::DropDown::from_strings(&["System default"]);
     devices.update_property(&[gtk::accessible::Property::Label("Audio device")]);
     dev_box.append(&devices);
+    let note = bluetooth_note(dir);
+    dev_box.append(&note);
     side.append(&dev_box);
 
     let split = adw::OverlaySplitView::builder()
@@ -1292,7 +1294,31 @@ fn chain_page(
         .sync_create()
         .bidirectional()
         .build();
-    (split, devices)
+    (split, devices, note)
+}
+
+/// What Bluetooth headphones that have to switch to their headset profile for their
+/// microphone do differently, shown under the device picker only while the Microphone
+/// uses such a microphone. Hidden otherwise.
+fn bluetooth_note(dir: Direction) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_margin_top(4);
+    row.set_visible(false);
+    if dir == Direction::Mic {
+        let icon = gtk::Image::from_icon_name("dialog-information-symbolic");
+        icon.add_css_class("caption-dim");
+        icon.set_valign(gtk::Align::Start);
+        row.append(&icon);
+        let text = label(
+            "While an app records, Bluetooth headphones switch to headset sound quality. Until then the meters stay quiet.",
+            "caption-dim",
+        );
+        text.set_wrap(true);
+        text.set_wrap_mode(pango::WrapMode::WordChar);
+        text.set_hexpand(true);
+        row.append(&text);
+    }
+    row
 }
 
 fn run_in_background_menu() -> gio::Menu {
@@ -1517,8 +1543,8 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
         .tooltip_text("Toggle Sidebar")
         .build();
 
-    let (out_page, out_dev) = chain_page(&ctx, &win, &toasts, Direction::Output, &toggle, &live);
-    let (mic_page, mic_dev) = chain_page(&ctx, &win, &toasts, Direction::Mic, &toggle, &live);
+    let (out_page, out_dev, _) = chain_page(&ctx, &win, &toasts, Direction::Output, &toggle, &live);
+    let (mic_page, mic_dev, mic_note) = chain_page(&ctx, &win, &toasts, Direction::Mic, &toggle, &live);
     stack.add_titled_with_icon(&out_page, Some("output"), "Output", "audio-speakers-symbolic");
     stack.add_titled_with_icon(&mic_page, Some("mic"), "Microphone", "audio-input-microphone-symbolic");
 
@@ -1683,13 +1709,14 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
 
     // Messages from the audio thread.
     {
-        let (ctx2, lists, fill, toasts2) = (ctx.clone(), device_lists.clone(), fill_devices.clone(), toasts.clone());
+        let (ctx2, lists, fill, toasts2, note) = (ctx.clone(), device_lists.clone(), fill_devices.clone(), toasts.clone(), mic_note.clone());
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
-                    Event::Devices { sinks, sources } => {
+                    Event::Devices { sinks, sources, headset_switch } => {
                         *lists.borrow_mut() = [sinks, sources];
                         fill();
+                        note.set_visible(headset_switch[Direction::Mic as usize]);
                     }
                     Event::TurnedOffExternally(dir) => ctx2.set_enabled(dir, false),
                     Event::Error(message) => toasts2.add_toast(plain_toast(&message)),
@@ -1698,10 +1725,17 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
         });
     }
 
-    // Start what was running last time.
+    // Start what was running last time. A chain that stays off still needs to know its
+    // chosen device, to say what it would use (the Bluetooth note).
     for dir in DIRS {
-        if ctx.state.borrow().chain(dir).enabled {
+        let (enabled, device) = {
+            let s = ctx.state.borrow();
+            (s.chain(dir).enabled, s.chain(dir).device.clone())
+        };
+        if enabled {
             ctx.start(dir);
+        } else {
+            ctx.engine.send(Cmd::Device(dir, device));
         }
     }
 

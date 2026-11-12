@@ -133,6 +133,9 @@ class App:
             run("pactl", "unload-module", module)
             sys.exit("Couldn't read the volume of the app's virtual device")
         run("pactl", "set-sink-volume", "equalizer_sink", "100%")
+        # For a moment after the app passes a volume on, the device going back to the
+        # volume it had counts as a late report, not a change (STALE_WAIT).
+        time.sleep(0.6)
 
     def __enter__(self):
         return self
@@ -258,6 +261,71 @@ with App(lambda s: None):
     if device != ["70", "70"]:
         fails.append("device follows the app's volume")
     check("at 70%: through the app vs straight into the device", measure(1000) - measure(1000, into="eqmeasure"), 0.0, tol=0.3)
+
+print("Bluetooth headphones' late volume reports")
+# After a volume change, Bluetooth headphones report the volume they had once more, a
+# few milliseconds later, then confirm the new one. The app used to take the old one
+# for a change on the device and put it back on its own volume.
+with App(lambda s: None):
+    run("pactl", "set-sink-volume", "eqmeasure", "50%")
+    time.sleep(0.6)
+    run("pactl", "set-sink-volume", "equalizer_sink", "70%")
+    time.sleep(0.008)
+    run("pactl", "set-sink-volume", "eqmeasure", "50%")
+    run("pactl", "set-sink-volume", "eqmeasure", "50%")
+    time.sleep(0.23)
+    run("pactl", "set-sink-volume", "eqmeasure", "70%")
+    time.sleep(1.0)
+    shown = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "equalizer_sink"))
+    device = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "eqmeasure"))
+    ok = shown == device == ["70", "70"]
+    print(f"  {'ok  ' if ok else 'FAIL'} set to 70%: the app shows {'/'.join(shown)}%, the device is at {'/'.join(device)}%")
+    if not ok:
+        fails.append("late volume reports")
+    check("after the reports: through the app vs straight into the device", measure(1000) - measure(1000, into="eqmeasure"), 0.0, tol=0.3)
+
+print("The Output comes back to its device")
+# Bluetooth headphones replace their output when they switch to their headset profile and
+# back, and a USB device can be unplugged and plugged in again. The app moves to another
+# device while it's gone, and has to come back. Nothing plays here.
+
+
+def out_linked_to():
+    objs = json.loads(run("pw-dump") or "[]")
+    names = {o["id"]: (o.get("info") or {}).get("props", {}).get("node.name") for o in objs if o["type"].endswith("Node")}
+    out = [i for i, n in names.items() if n == "equalizer_out"]
+    return sorted({names.get(o["info"]["input-node-id"]) for o in objs
+                   if o["type"].endswith("Link") and out and o["info"]["output-node-id"] == out[0]})
+
+
+def returning_device():
+    return run("pactl", "load-module", "module-null-sink", "sink_name=eqreturn",
+               "sink_properties=device.description=EqReturn")
+
+
+ret = returning_device()
+# Listed first, so that the app moves there while the device is gone, not to a real one.
+fallback = run("pactl", "load-module", "module-null-sink", "sink_name=eqfallback",
+               "sink_properties=device.description=\"AAA EqFallback\"")
+time.sleep(0.5)
+device_before = template["output"]["device"]
+template["output"]["device"] = "eqreturn"
+with App(lambda s: None):
+    first = out_linked_to()
+    run("pactl", "unload-module", ret)
+    time.sleep(1.0)
+    away = out_linked_to()
+    ret = returning_device()
+    time.sleep(1.0)
+    back = out_linked_to()
+    ok = first == ["eqreturn"] and away == ["eqfallback"] and back == ["eqreturn"]
+    print(f"  {'ok  ' if ok else 'FAIL'} plays through {'/'.join(first) or '-'}, then {'/'.join(away) or '-'} while it's gone, "
+          f"then {'/'.join(back) or '-'} when it's back")
+    if not ok:
+        fails.append("comes back to its device")
+template["output"]["device"] = device_before
+run("pactl", "unload-module", ret)
+run("pactl", "unload-module", fallback)
 
 print("Default device")
 before = run("pw-metadata", "-n", "default", "0", "default.configured.audio.sink")
