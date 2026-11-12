@@ -4,7 +4,7 @@
 # and in the repository root that would be the app's source code.
 
 pkgname=equalizer
-pkgver=0.0.6
+pkgver=0.0.7
 pkgrel=1
 pkgdesc='A clean, simple audio equalizer for GNOME'
 arch=('x86_64')

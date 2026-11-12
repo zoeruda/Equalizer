@@ -1,6 +1,6 @@
 [package]
 name = "equalizer"
-version = "0.0.6"
+version = "0.0.7"
 description = "A clean, simple audio equalizer for GNOME"
 edition = "2024"
 license = "GPL-3.0-or-later"
