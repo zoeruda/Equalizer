@@ -141,6 +141,7 @@ On the graph:
 | Add a band | Double-click an empty spot |
 | Change its width | Scroll over the point |
 | Reset its gain | Double-click the point |
+| Reset a slider | Double-click it |
 | Type an exact value | Click the number beside a slider |
 | Keyboard | Arrows move a point (Shift for fine steps), Tab and Shift+Tab cycle through the points, Delete removes one, + adds one, Escape leaves the graph |
 
@@ -160,9 +161,9 @@ the Microphone's are for your voice, such as Clear Voice, Noisy Room and Podcast
 You can also import AutoEq and Equalizer APO files, which is the usual format for
 headphone correction.
 
-Closing the window keeps the sound processing running. Open the app again to bring
-the window back, or use **Quit** in the menu (Ctrl+Q) to stop. Both behaviors, and
-starting at login, are in the menu.
+Closing the window keeps the sound processing running by default. Open the app again to bring
+the window back, and use **Quit** in the menu (Ctrl+Q) to stop it completely. You can also set it
+to quit upon closing the window, or start at login, in the menu.
 
 Settings live in `~/.config/equalizer/`, or in
 `~/.var/app/io.github.zoeruda.Equalizer/config/equalizer/` for the Flatpak. Your
@@ -192,6 +193,7 @@ entry in the `EFFECTS` table in `model.rs`, plus a place in `Direction::chain`.
     DISPLAY=:0 python3 tests/measure.py target/release/equalizer
     DISPLAY=:0 python3 tests/mic.py target/release/equalizer
     DISPLAY=:0 python3 tests/memory.py target/release/equalizer
+    DISPLAY=:0 python3 tests/ui.py target/release/equalizer
 
 The second one runs the real app with tones going to a temporary silent device. It
 compares what comes out with what the graph shows, and it needs a display and a
@@ -220,6 +222,12 @@ the binary to run only those: `playback`, `hide`, `pages`, `active`, `presets` o
 - `--wrap COMMAND` runs the app under another program, such as a heap profiler, to
   find where a failing scenario's memory goes:
   `tests/memory.py target/release/equalizer hide --wrap heaptrack`.
+
+The fifth checks what the pointer does: double-clicks and drags on the graph,
+double-clicks on the sliders, and typing in the numbers beside them. Accessibility can't press and release a
+pointer, so it sends a real pointer and real keys through GNOME's remote-desktop
+interface, and it only runs in a GNOME session. It leaves both chains off, so no sound
+is touched. For about half a minute the pointer and the keyboard are the test's.
 
 ## Special recognition
 

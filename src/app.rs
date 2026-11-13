@@ -280,11 +280,13 @@ struct Slider<'a> {
     max: f64,
     log: bool,
     unit: &'a str,
+    /// What a double-click on the slider returns it to.
+    default: f64,
 }
 
 /// A labelled slider whose value can also be clicked and typed in.
 fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk::Box, Rc<dyn Fn()>) {
-    let (min, max, log) = (spec.min, spec.max, spec.log);
+    let (min, max, log, default) = (spec.min, spec.max, spec.log, spec.default);
     let to_pos = move |v: f64| {
         if log {
             (v / min).ln() / (max / min).ln()
@@ -354,6 +356,55 @@ fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk:
             sync();
         });
     }
+    // Double-click: the slider returns to its default, as a point on the graph returns to
+    // 0 dB. The slider's own gestures claim each press, which makes GTK forget this one's
+    // count of them, so the two presses are matched up here. It sees a press before the
+    // slider does, and keeps the second one from it, or the slider would jump to the pointer.
+    let reset = gtk::GestureClick::new();
+    reset.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let (set, sync, scale2) = (set.clone(), sync.clone(), scale.clone());
+        let last: Cell<Option<(u32, f64, f64)>> = Cell::new(None);
+        reset.connect_pressed(move |g, _, x, y| {
+            let time = g.current_event_time();
+            let settings = scale2.settings();
+            let (within, reach) = (settings.gtk_double_click_time() as u32, settings.gtk_double_click_distance() as f64);
+            let second = last.get().is_some_and(|(t, lx, ly)| time.wrapping_sub(t) <= within && (x - lx).abs() <= reach && (y - ly).abs() <= reach);
+            if second {
+                last.set(None);
+                g.set_state(gtk::EventSequenceState::Claimed);
+                set(default);
+                sync();
+            } else {
+                last.set(Some((time, x, y)));
+            }
+        });
+    }
+    scale.add_controller(reset);
+
+    // A value that's being typed stays open until Enter, Escape, or the focus moving on.
+    // When the focus moves on, GTK closes it a moment later, and then gives the focus
+    // back to it: away from what was just clicked. If that was another value, its cursor
+    // showed for a moment and went away, and it took a second click to type in it. So the
+    // value is closed here first, and the focus is put back where it went.
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave(|c| {
+        let Some(value) = c.widget().and_downcast::<gtk::EditableLabel>() else { return };
+        // The window's focus is only known once the change is over.
+        glib::idle_add_local_once(move || {
+            if !value.is_editing() {
+                return;
+            }
+            // When the window itself is left, the focus stays in the value, and GTK closes it.
+            let Some(target) = value.root().and_then(|r| r.focus()) else { return };
+            if target.is_ancestor(&value) {
+                return;
+            }
+            value.stop_editing(true);
+            target.grab_focus();
+        });
+    });
+    value.add_controller(focus);
     sync();
     (root, sync)
 }
@@ -604,6 +655,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
             max: 20000.0,
             log: true,
             unit: "Hz",
+            default: 1000.0,
         },
         band_get(ctx, |b| b.freq, 1000.0),
         band_set(ctx, |b, v| b.freq = v),
@@ -616,6 +668,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
             max: GAIN_LIMIT,
             log: false,
             unit: "dB",
+            default: 0.0,
         },
         band_get(ctx, |b| b.gain, 0.0),
         band_set(ctx, |b, v| b.gain = v),
@@ -628,6 +681,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
             max: 20.0,
             log: true,
             unit: "Q",
+            default: 1.0,
         },
         band_get(ctx, |b| b.q, 1.0),
         band_set(ctx, |b, v| b.q = v),
@@ -740,6 +794,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
                 max: GAIN_LIMIT,
                 log: false,
                 unit: "dB",
+                default: 0.0,
             },
             Rc::new(move || c1.state.borrow().chain(dir).sound.preamp),
             Rc::new(move |v| c2.edit_sound(dir, |s| s.preamp = v)),
@@ -755,6 +810,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
                 max: 100.0,
                 log: false,
                 unit: "%",
+                default: 0.0,
             },
             Rc::new(move || c1.state.borrow().chain(dir).sound.balance),
             Rc::new(move |v| c2.edit_sound(dir, |s| s.balance = v)),
@@ -868,6 +924,7 @@ fn effect_page(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &
                 max: param.max,
                 log: param.log,
                 unit: param.unit,
+                default: param.default,
             },
             Rc::new(move || c1.state.borrow().chain(dir).sound.param(spec.id, param.id)),
             Rc::new(move |v| {

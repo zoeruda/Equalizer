@@ -33,6 +33,9 @@ pub const CSS: &str = r#"
 .section-title { font-size: 12.5px; font-weight: 700; opacity: 0.85; margin-top: 6px; }
 .param-label { font-size: 12.5px; opacity: 0.8; }
 .param-value { font-size: 12.5px; font-weight: 700; font-feature-settings: "tnum"; }
+/* While a value is typed, it keeps its place and its look: the cursor and the selection
+   show that it's open, without the box of a text field around it. */
+.param-value > stack > text { background: none; border: none; border-radius: 0; box-shadow: none; outline: none; padding: 0; min-height: 0; }
 .blurb { font-size: 12.5px; opacity: 0.72; }
 .tile-name { font-weight: 700; }
 .tile-value { font-size: 12px; opacity: 0.72; font-feature-settings: "tnum"; }

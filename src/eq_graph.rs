@@ -161,16 +161,13 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> EqWidget {
             let start = found.map(|i| (handle_pos(&bands[i], w, h, RANGE), bands[i].freq));
             drop(s);
             area2.grab_focus();
-            match (found, start) {
-                (Some(band), Some((start, start_freq))) => {
-                    *dragging.borrow_mut() = Some(Drag { band, start, start_freq });
-                    ctx.select(dir, band);
-                    area2.set_cursor_from_name(Some("grabbing"));
-                    g.set_state(gtk::EventSequenceState::Claimed);
-                }
-                _ => {
-                    g.set_state(gtk::EventSequenceState::Denied);
-                }
+            // A press on empty space isn't denied: the click gesture shares this one's
+            // state, and it needs those presses to count a double-click.
+            if let (Some(band), Some((start, start_freq))) = (found, start) {
+                *dragging.borrow_mut() = Some(Drag { band, start, start_freq });
+                ctx.select(dir, band);
+                area2.set_cursor_from_name(Some("grabbing"));
+                g.set_state(gtk::EventSequenceState::Claimed);
             }
         });
     }
@@ -197,12 +194,12 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> EqWidget {
             area2.queue_draw();
         });
     }
-    area.add_controller(drag);
+    area.add_controller(drag.clone());
 
     // Double-click: empty space adds a point, an existing point returns to 0 dB.
     let click = gtk::GestureClick::new();
     {
-        let (ctx, area2, hover) = (ctx.clone(), area.clone(), hover.clone());
+        let (ctx, area2, hover, dragging) = (ctx.clone(), area.clone(), hover.clone(), dragging.clone());
         click.connect_pressed(move |_, n, x, y| {
             let (w, h) = (area2.width() as f64, area2.height() as f64 - AXIS_H);
             let found = hit(&ctx.state.borrow().chain(dir).sound.bands, x, y, w, h, RANGE);
@@ -210,6 +207,9 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> EqWidget {
             if let Some(i) = found {
                 ctx.select(dir, i);
                 if n == 2 {
+                    // The second press also began a drag. It ends here, so the pointer
+                    // moving a little before the release doesn't drag the gain back.
+                    *dragging.borrow_mut() = None;
                     ctx.edit_band(dir, i, |b| b.gain = 0.0);
                 }
             } else if n == 2 && y <= h {
@@ -222,7 +222,12 @@ pub fn build(ctx: Rc<Ctx>, dir: Direction) -> EqWidget {
             area2.queue_draw();
         });
     }
-    area.add_controller(click);
+    area.add_controller(click.clone());
+    // A gesture that claims a press cancels the widget's other gestures, unless they're
+    // grouped. The drag claims every press on a point, so without this the click never
+    // saw a second press there, and a double-click on a point did nothing. Gestures can
+    // only be grouped once they're both on the widget.
+    click.group_with(&drag);
 
     // Scroll over a point to make it wider or narrower.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
