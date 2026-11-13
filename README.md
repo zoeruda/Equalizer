@@ -223,11 +223,13 @@ the binary to run only those: `playback`, `hide`, `pages`, `active`, `presets` o
   find where a failing scenario's memory goes:
   `tests/memory.py target/release/equalizer hide --wrap heaptrack`.
 
-The fifth checks what the pointer does: double-clicks and drags on the graph,
-double-clicks on the sliders, and typing in the numbers beside them. Accessibility can't press and release a
-pointer, so it sends a real pointer and real keys through GNOME's remote-desktop
-interface, and it only runs in a GNOME session. It leaves both chains off, so no sound
-is touched. For about half a minute the pointer and the keyboard are the test's.
+The fifth checks what the pointer and the keyboard do: double-clicks and drags on the
+graph, double-clicks on the sliders, and typing in the numbers beside them, on the
+Output's Equalizer and Compressor pages and on the Microphone's tab. Accessibility
+can't press and release a pointer, so it sends a real pointer and real keys through
+GNOME's remote-desktop interface, and it only runs in a GNOME session. It leaves both
+chains off, so no sound is touched. For about two minutes the pointer and the keyboard
+are the test's.
 
 ## Special recognition
 
