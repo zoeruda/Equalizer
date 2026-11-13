@@ -12,6 +12,8 @@ Checked, on the Output's Equalizer page:
   values   a click on the number beside a slider opens it for typing, and what's typed
            is taken. With one number left open, a click on another opens that one, and
            it stays open. A click on the graph then gives the graph the keyboard
+           With a number open, a click on another band's point leaves that band as
+           it was, and a number typed but not entered goes to the band it was typed for
   sliders  a double-click on a slider returns it to its default, where a single click
            moves it to the pointer
 
@@ -402,6 +404,36 @@ def values(app, win, hands, freq):
     s = app.saved(lambda s: band_near(s, freq)["gain"] == was + 0.5)
     report(band_near(s, freq)["gain"] == was + 0.5 and len(s["bands"]) == 2,
            f"with a number open, a click on the graph gives it the keyboard (gain {band_near(s, freq)['gain']:+.1f} dB after the Up key, from {was:+.1f})")
+
+    # The other band, which the first double-click added. The pointer doesn't move between
+    # the press and the release, or the drag that starts would hide what the press did.
+    mine = dict(band_near(s, freq))
+    other = dict(max(s["bands"], key=lambda b: abs(math.log(b["freq"] / freq))))
+    point = lambda b: win.screen(*win.graph_point(b["freq"], b["gain"]))
+    same = lambda a, b: all(abs(a[k] - b[k]) < 1e-6 for k in ("freq", "gain", "q"))
+    for name in ("Gain", "Frequency"):
+        hands.click(*win.value(name))
+        sleep(0.5)
+        hands.click(*point(other))
+        sleep(1.6)
+        s = app.saved(lambda s: False, timeout=0.5)
+        now = band_near(s, other["freq"])
+        report(same(now, other) and same(band_near(s, freq), mine),
+               f"with the {name} number open, a click on another band's point changes neither band (that band: {now['freq']:.0f} Hz {now['gain']:+.1f} dB, was {other['freq']:.0f} Hz {other['gain']:+.1f} dB)")
+        hands.click(*point(mine))
+        sleep(0.5)
+
+    hands.click(*win.value("Gain"))
+    sleep(0.5)
+    hands.type("5")
+    hands.click(*point(other))
+    s = app.saved(lambda s: band_near(s, freq)["gain"] == 5.0)
+    now = band_near(s, other["freq"])
+    report(band_near(s, freq)["gain"] == 5.0 and same(now, other),
+           f"a number typed but not entered goes to the band it was typed for (its gain {band_near(s, freq)['gain']:+.1f} dB, typed 5; the clicked band's {now['gain']:+.1f} dB, was {other['gain']:+.1f})")
+    # The sliders are checked on the first band, so it's selected again, at its new gain.
+    hands.click(*win.screen(*win.graph_point(mine["freq"], 5.0)))
+    sleep(0.5)
 
 
 def sliders(app, win, hands, freq):

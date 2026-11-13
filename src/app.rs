@@ -341,18 +341,31 @@ fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk:
             set(v);
         });
     }
-    {
-        let (set, sync, get, unit) = (set.clone(), sync.clone(), get.clone(), unit.clone());
-        value.connect_editing_notify(move |l| {
-            if l.is_editing() {
-                return;
-            }
-            // Only a value that was really retyped counts; just clicking away changes nothing.
-            if l.text() != fmt_unit(get(), &unit)
+    // Takes what was typed, once. Only a value that was really retyped counts: just
+    // clicking away changes nothing. And only while the setting is still what it was when
+    // the value was opened. If it changed underneath (another band was selected, a preset
+    // was loaded), what's typed was meant for what was there before, and it's dropped.
+    let opened: Rc<RefCell<Option<(String, f64)>>> = Rc::new(RefCell::new(None));
+    let take: Rc<dyn Fn(&gtk::EditableLabel)> = {
+        let (set, get, opened) = (set.clone(), get.clone(), opened.clone());
+        Rc::new(move |l| {
+            let Some((shown, was)) = opened.borrow_mut().take() else { return };
+            if l.text() != shown
+                && get() == was
                 && let Some(v) = parse_number(&l.text())
             {
                 set(v.clamp(min, max));
             }
+        })
+    };
+    {
+        let (take, sync, get, opened) = (take.clone(), sync.clone(), get.clone(), opened.clone());
+        value.connect_editing_notify(move |l| {
+            if l.is_editing() {
+                *opened.borrow_mut() = Some((l.text().to_string(), get()));
+                return;
+            }
+            take(l);
             sync();
         });
     }
@@ -388,8 +401,16 @@ fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk:
     // showed for a moment and went away, and it took a second click to type in it. So the
     // value is closed here first, and the focus is put back where it went.
     let focus = gtk::EventControllerFocus::new();
-    focus.connect_leave(|c| {
+    focus.connect_leave(move |c| {
         let Some(value) = c.widget().and_downcast::<gtk::EditableLabel>() else { return };
+        // Taken right away: a press on another band's point moves the focus first and
+        // selects that band next, and what's typed belongs to the band it was typed for.
+        // The value may stay open, as when the focus only passes through on its way back
+        // from the value that was open before. So what's typed from here on counts anew.
+        if value.is_editing() {
+            take(&value);
+            *opened.borrow_mut() = Some((value.text().to_string(), get()));
+        }
         // The window's focus is only known once the change is over.
         glib::idle_add_local_once(move || {
             if !value.is_editing() {
