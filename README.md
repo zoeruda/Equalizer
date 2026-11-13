@@ -197,7 +197,10 @@ entry in the `EFFECTS` table in `model.rs`, plus a place in `Direction::chain`.
 
 The second one runs the real app with tones going to a temporary silent device. It
 compares what comes out with what the graph shows, and it needs a display and a
-running PipeWire session.
+running PipeWire session. It also fails when the installed LSP Plugins have a control
+the app doesn't know, as after an LSP update: look at what the control does, then add
+it to `LEFT_AT_DEFAULT` in `src/model.rs` with the reason, and run
+`UPDATE_KNOWN_PORTS=1 cargo test known_ports`.
 
 The third does the same for the Microphone. It never opens your real microphone: it
 plays its tones into a temporary fake one. It also clicks through the Microphone tab

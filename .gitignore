@@ -3,5 +3,6 @@
 /flatpak-build
 /flatpak-repo
 /Equalizer.flatpak
+__pycache__/
 /packaging/arch/*
 !/packaging/arch/PKGBUILD

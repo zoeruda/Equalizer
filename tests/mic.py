@@ -475,6 +475,23 @@ def sound_tests():
         report(-16 < peak <= -11.8, f"ceiling -12: a -3 dB tone peaks at {peak:+.2f} dB")
         check("ceiling -12: a -24 dB tone is untouched", measure(1000, db=-24.0), -24.0)
 
+    print("Each effect on its own, at neutral settings")
+    # An effect that's on and set to do nothing must leave the level alone, as in
+    # tests/measure.py. A plugin control the app leaves at its default can break that.
+    # The tone is at Auto Gain's target, and far above the gate's threshold.
+    neutral = {
+        "gate": effect("gate"),
+        "autogain": effect("autogain", target=LEVEL_DB),
+        "eq": lambda s: s.update(bands=[band("Bell", 1000.0, 0.0, 1.0), band("LowShelf", 100.0, 0.0, 0.7), band("HighShelf", 8000.0, 0.0, 0.7)]),
+        "compressor": effect("compressor", ratio=1.0, makeup=0.0),
+        "limiter": effect("limiter"),
+    }
+    for name, mutate in neutral.items():
+        with App(mutate):
+            # Auto Gain measures loudness as the ear hears it, so only 1 kHz is at its target.
+            for f in [1000] if name == "autogain" else [100, 1000, 8000]:
+                check(f"{name} on, doing nothing, at {f} Hz", measure(f, seconds=3.0) - LEVEL_DB, 0.0, tol=0.5)
+
     print("With the window hidden, running in the background")
     bell = band("Bell", 1000.0, 9.0, 1.4)
 

@@ -931,9 +931,482 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
     Ok(sound)
 }
 
+/// Every plugin control the app doesn't set, with why the value it gets is fine, or what's
+/// open about it. Such a control gets what PipeWire works out from the plugin's LADSPA hint,
+/// which often isn't LSP's own default. `{n}` stands for each band's number.
+///
+/// `tests/measure.py` fails when the installed plugin has a control that's neither set by
+/// the app nor listed here, so a new or renamed control in an LSP update gets looked at.
+/// It reads `tests/known-ports.json`, which a test below keeps the same as this list.
+#[cfg(test)]
+static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
+    ("gate_stereo", "Show pre-mix overlay", "Only for the plugin's own window"),
+    (
+        "gate_stereo",
+        "Input to Link mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    (
+        "gate_stereo",
+        "Link to Input mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    (
+        "gate_stereo",
+        "Link to Sidechain mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    ("gate_stereo", "Input gain (G)", "1: no change in level"),
+    ("gate_stereo", "Output gain (G)", "1: no change in level"),
+    ("gate_stereo", "Show mix overlay", "Only for the plugin's own window"),
+    ("gate_stereo", "Show sidechain overlay", "Only for the plugin's own window"),
+    ("gate_stereo", "Pause graph analysis", "Only for the plugin's own window"),
+    ("gate_stereo", "Clear graph analysis", "Only for the plugin's own window"),
+    ("gate_stereo", "Stereo split", "Off: left and right are processed together"),
+    ("gate_stereo", "Split sidechain source", "Not read with Stereo split off"),
+    ("gate_stereo", "Sidechain input", "0: it listens to its own input"),
+    (
+        "gate_stereo",
+        "Sidechain lookahead (ms)",
+        "0. Anything else delays the sound by as much",
+    ),
+    (
+        "gate_stereo",
+        "Sidechain listen",
+        "Off. On would play the sidechain in place of the sound",
+    ),
+    ("gate_stereo", "Sidechain source", "0: the middle of left and right"),
+    (
+        "gate_stereo",
+        "Sidechain reactivity (ms)",
+        "0 by the hint, LSP has 10: RMS acts as peak. Open: 0.0.8 Part 1, found 1",
+    ),
+    ("gate_stereo", "Sidechain preamp (G)", "No change in the sidechain's level"),
+    ("gate_stereo", "High-pass filter mode", "Off: the sidechain isn't filtered"),
+    (
+        "gate_stereo",
+        "High-pass filter frequency (Hz)",
+        "Not read with the sidechain filter off",
+    ),
+    ("gate_stereo", "Low-pass filter mode", "Off: the sidechain isn't filtered"),
+    (
+        "gate_stereo",
+        "Low-pass filter frequency (Hz)",
+        "Not read with the sidechain filter off",
+    ),
+    ("gate_stereo", "Hysteresis", "Off"),
+    (
+        "gate_stereo",
+        "Curve zone size (G)",
+        "-15 dB by the hint, where LSP has -6. Open: 0.0.8 Part 1, found 2",
+    ),
+    ("gate_stereo", "Hysteresis threshold (G)", "Not read with Hysteresis off"),
+    ("gate_stereo", "Hysteresis zone size (G)", "Not read with Hysteresis off"),
+    ("gate_stereo", "Hold time (ms)", "0: no hold"),
+    ("gate_stereo", "Makeup gain (G)", "1: no change in level"),
+    ("gate_stereo", "Dry gain (G)", "Only the processed sound comes out"),
+    ("gate_stereo", "Wet gain (G)", "Only the processed sound comes out"),
+    ("gate_stereo", "Dry/Wet balance (%)", "Only the processed sound comes out"),
+    ("gate_stereo", "Sidechain level visibility Left", "Only for the plugin's own window"),
+    ("gate_stereo", "Envelope level visibility Left", "Only for the plugin's own window"),
+    ("gate_stereo", "Gain reduction visibility Left", "Only for the plugin's own window"),
+    ("gate_stereo", "Input level visibility Left", "Only for the plugin's own window"),
+    ("gate_stereo", "Output level visibility Left", "Only for the plugin's own window"),
+    (
+        "gate_stereo",
+        "Sidechain level visibility Right",
+        "Only for the plugin's own window",
+    ),
+    ("gate_stereo", "Envelope level visibility Right", "Only for the plugin's own window"),
+    ("gate_stereo", "Gain reduction visibility Right", "Only for the plugin's own window"),
+    ("gate_stereo", "Input level visibility Right", "Only for the plugin's own window"),
+    ("gate_stereo", "Output level visibility Right", "Only for the plugin's own window"),
+    ("autogain_stereo", "Sidechain preamp (dB)", "No change in the sidechain's level"),
+    (
+        "autogain_stereo",
+        "Sidechain lookahead (ms)",
+        "0. Anything else delays the sound by as much",
+    ),
+    ("autogain_stereo", "Sidechain mode", "0: it listens to its own input"),
+    (
+        "autogain_stereo",
+        "Sidechain metering enable for long period",
+        "A meter nothing reads",
+    ),
+    (
+        "autogain_stereo",
+        "Sidechain metering enable for short period",
+        "A meter nothing reads",
+    ),
+    (
+        "autogain_stereo",
+        "Loudness measuring long period (ms)",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Loudness measuring short period (ms)",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Weighting function",
+        "5: K-weighting, which LUFS is measured with",
+    ),
+    ("autogain_stereo", "Level drift (dB)", "12, as LSP has it"),
+    ("autogain_stereo", "The level of silence (LUFS)", "-72, as LSP has it"),
+    ("autogain_stereo", "Enable quick amplifier", "Off, as LSP has it"),
+    (
+        "autogain_stereo",
+        "Long gain grow amount",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Long gain grow time (ms)",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Long gain fall amount",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Long gain fall time (ms)",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Short gain grow amount",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Short gain grow time (ms)",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Short gain fall amount",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    (
+        "autogain_stereo",
+        "Short gain fall time (ms)",
+        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    ),
+    ("autogain_stereo", "Input metering enable for long period", "A meter nothing reads"),
+    ("autogain_stereo", "Input metering enable for short period", "A meter nothing reads"),
+    ("autogain_stereo", "Output metering enable for long period", "A meter nothing reads"),
+    (
+        "autogain_stereo",
+        "Output metering enable for short period",
+        "A meter nothing reads",
+    ),
+    ("autogain_stereo", "Gain correction metering", "A meter nothing reads"),
+    ("compressor_stereo", "Show pre-mix overlay", "Only for the plugin's own window"),
+    (
+        "compressor_stereo",
+        "Input to Link mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    (
+        "compressor_stereo",
+        "Link to Input mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    (
+        "compressor_stereo",
+        "Link to Sidechain mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    ("compressor_stereo", "Input gain (G)", "1: no change in level"),
+    ("compressor_stereo", "Output gain (G)", "1: no change in level"),
+    ("compressor_stereo", "Show mix overlay", "Only for the plugin's own window"),
+    ("compressor_stereo", "Show sidechain overlay", "Only for the plugin's own window"),
+    ("compressor_stereo", "Pause graph analysis", "Only for the plugin's own window"),
+    ("compressor_stereo", "Clear graph analysis", "Only for the plugin's own window"),
+    ("compressor_stereo", "Stereo split", "Off: left and right are processed together"),
+    ("compressor_stereo", "Split sidechain source", "Not read with Stereo split off"),
+    ("compressor_stereo", "Sidechain type", "0: feed-forward, from its own input"),
+    (
+        "compressor_stereo",
+        "Sidechain lookahead (ms)",
+        "0. Anything else delays the sound by as much",
+    ),
+    (
+        "compressor_stereo",
+        "Sidechain listen",
+        "Off. On would play the sidechain in place of the sound",
+    ),
+    ("compressor_stereo", "Sidechain source", "0: the middle of left and right"),
+    (
+        "compressor_stereo",
+        "Sidechain reactivity (ms)",
+        "0 by the hint, LSP has 10: RMS acts as peak. Open: 0.0.8 Part 1, found 1",
+    ),
+    ("compressor_stereo", "Sidechain preamp (G)", "No change in the sidechain's level"),
+    ("compressor_stereo", "High-pass filter mode", "Off: the sidechain isn't filtered"),
+    (
+        "compressor_stereo",
+        "High-pass filter frequency (Hz)",
+        "Not read with the sidechain filter off",
+    ),
+    ("compressor_stereo", "Low-pass filter mode", "Off: the sidechain isn't filtered"),
+    (
+        "compressor_stereo",
+        "Low-pass filter frequency (Hz)",
+        "Not read with the sidechain filter off",
+    ),
+    (
+        "compressor_stereo",
+        "Release threshold (G)",
+        "0: the release doesn't depend on the level, as LSP has it",
+    ),
+    ("compressor_stereo", "Hold time (ms)", "0: no hold"),
+    ("compressor_stereo", "Boost threshold (G)", "Not read in the downward mode"),
+    ("compressor_stereo", "Boost signal amount (G)", "Not read in the downward mode"),
+    ("compressor_stereo", "Dry gain (G)", "Only the processed sound comes out"),
+    ("compressor_stereo", "Wet gain (G)", "Only the processed sound comes out"),
+    ("compressor_stereo", "Dry/Wet balance (%)", "Only the processed sound comes out"),
+    (
+        "compressor_stereo",
+        "Sidechain level visibility Left",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Envelope level visibility Left",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Gain reduction visibility Left",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Input level visibility Left",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Output level visibility Left",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Sidechain level visibility Right",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Envelope level visibility Right",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Gain reduction visibility Right",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Input level visibility Right",
+        "Only for the plugin's own window",
+    ),
+    (
+        "compressor_stereo",
+        "Output level visibility Right",
+        "Only for the plugin's own window",
+    ),
+    ("para_equalizer_x32_stereo", "Output gain (G)", "1: no change in level"),
+    (
+        "para_equalizer_x32_stereo",
+        "Equalizer mode",
+        "0: IIR. The other modes delay the sound by 85 to 128 ms",
+    ),
+    (
+        "para_equalizer_x32_stereo",
+        "FFT reactivity (ms)",
+        "Only for the plugin's own window",
+    ),
+    ("para_equalizer_x32_stereo", "Shift gain (G)", "Only for the plugin's own window"),
+    ("para_equalizer_x32_stereo", "Graph zoom (G)", "Only for the plugin's own window"),
+    ("para_equalizer_x32_stereo", "Filter select", "Only for the plugin's own window"),
+    (
+        "para_equalizer_x32_stereo",
+        "Quantize note frequencies when editing",
+        "Only for the plugin's own window",
+    ),
+    (
+        "para_equalizer_x32_stereo",
+        "Inspected filter identifier",
+        "Only for the plugin's own window",
+    ),
+    (
+        "para_equalizer_x32_stereo",
+        "Inspect frequency range (oct)",
+        "Only for the plugin's own window",
+    ),
+    (
+        "para_equalizer_x32_stereo",
+        "Automatically inspect filter when editing",
+        "Only for the plugin's own window",
+    ),
+    (
+        "para_equalizer_x32_stereo",
+        "Frequency shift (st)",
+        "0: the bands stay where they're set",
+    ),
+    (
+        "para_equalizer_x32_stereo",
+        "Filter slope {n}",
+        "0: the plain slope, which the graph draws",
+    ),
+    ("para_equalizer_x32_stereo", "Filter solo {n}", "Off"),
+    ("para_equalizer_x32_stereo", "Filter mute {n}", "Off"),
+    (
+        "para_equalizer_x32_stereo",
+        "Filter Width {n} (oct)",
+        "Not read by the filter types the app uses",
+    ),
+    ("para_equalizer_x32_stereo", "Hue {n}", "Only for the plugin's own window"),
+    ("para_equalizer_x32_stereo", "Equalizer decramping", "0: off, as LSP has it"),
+    (
+        "loud_comp_stereo",
+        "Loudness contour standard",
+        "4: ISO 226:2023, LSP's own default",
+    ),
+    ("loud_comp_stereo", "FFT size", "Not read in IIR mode"),
+    ("loud_comp_stereo", "Enable reference generator", "Off. On would play a test signal"),
+    ("loud_comp_stereo", "Type of reference generator", "Not read with the generator off"),
+    ("loud_comp_stereo", "Hard-clipping enable", "Off: the limiter comes after"),
+    ("loud_comp_stereo", "Hard-clipping range (dB)", "Not read with hard-clipping off"),
+    (
+        "loud_comp_stereo",
+        "Clean hard-clipping indicators",
+        "Only for the plugin's own window",
+    ),
+    (
+        "loud_comp_stereo",
+        "Equalization curve is shown relative to the volume",
+        "Only for the plugin's own window",
+    ),
+    ("limiter_stereo", "Show pre-mix overlay", "Only for the plugin's own window"),
+    (
+        "limiter_stereo",
+        "Input to Link mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    (
+        "limiter_stereo",
+        "Link to Input mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    (
+        "limiter_stereo",
+        "Link to Sidechain mix (G)",
+        "0: nothing is mixed in from the unconnected link input",
+    ),
+    ("limiter_stereo", "Input gain (G)", "1: no change in level"),
+    ("limiter_stereo", "Output gain (G)", "1: no change in level"),
+    ("limiter_stereo", "Sidechain preamp (G)", "No change in the sidechain's level"),
+    (
+        "limiter_stereo",
+        "Automatic level regulation attack time (ms)",
+        "Not read with Automatic level regulation off",
+    ),
+    (
+        "limiter_stereo",
+        "Automatic level regulation release time (ms)",
+        "Not read with Automatic level regulation off",
+    ),
+    ("limiter_stereo", "Knee level (G)", "1: 0 dB, as LSP has it"),
+    ("limiter_stereo", "Oversampling", "0: none. Anything else adds delay"),
+    ("limiter_stereo", "Dithering", "0: none"),
+    ("limiter_stereo", "Pause graph analysis", "Only for the plugin's own window"),
+    ("limiter_stereo", "Clear graph analysis", "Only for the plugin's own window"),
+    ("limiter_stereo", "Sidechain type", "0: it listens to its own input"),
+    (
+        "limiter_stereo",
+        "Stereo linking (%)",
+        "100: left and right are turned down together",
+    ),
+    ("limiter_stereo", "Input graph visibility Left", "Only for the plugin's own window"),
+    ("limiter_stereo", "Output graph visibility Left", "Only for the plugin's own window"),
+    (
+        "limiter_stereo",
+        "Sidechain graph visibility Left",
+        "Only for the plugin's own window",
+    ),
+    ("limiter_stereo", "Gain graph visibility Left", "Only for the plugin's own window"),
+    ("limiter_stereo", "Input graph visibility Right", "Only for the plugin's own window"),
+    (
+        "limiter_stereo",
+        "Output graph visibility Right",
+        "Only for the plugin's own window",
+    ),
+    (
+        "limiter_stereo",
+        "Sidechain graph visibility Right",
+        "Only for the plugin's own window",
+    ),
+    ("limiter_stereo", "Gain graph visibility Right", "Only for the plugin's own window"),
+    (
+        "limiter_stereo",
+        "Knee smooth (dB)",
+        "-12 by the hint, where LSP has -5. Open: 0.0.8 Part 1, found 4",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each plugin's controls: the ones the app sets, and the ones it leaves, with why.
+    fn known_ports() -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut known: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut full = Sound::flat();
+        full.bands = (0..MAX_BANDS).map(|i| Band::bell(100.0 + i as f64, 0.0, 1.0)).collect();
+        for dir in [Direction::Output, Direction::Mic] {
+            for (key, _) in plugin_controls(&full, dir) {
+                let (id, port) = key.split_once(':').expect("node:control");
+                let plugin = if id == "eq" {
+                    "para_equalizer_x32_stereo"
+                } else {
+                    effect(id).plugin
+                };
+                known.entry(plugin.into()).or_default().insert(port.into(), "set by the app".into());
+            }
+        }
+        for (plugin, port, why) in LEFT_AT_DEFAULT {
+            let numbers = if port.contains("{n}") { MAX_BANDS } else { 1 };
+            for n in 0..numbers {
+                let port = port.replace("{n}", &n.to_string());
+                let before = known
+                    .entry(plugin.to_string())
+                    .or_default()
+                    .insert(port.clone(), format!("left: {why}"));
+                assert_eq!(before, None, "{plugin}: “{port}” is listed twice, or is set by the app too");
+            }
+        }
+        known
+    }
+
+    #[test]
+    fn the_known_ports_file_matches_the_list() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/known-ports.json");
+        let want = serde_json::to_string_pretty(&known_ports()).unwrap() + "\n";
+        if std::env::var_os("UPDATE_KNOWN_PORTS").is_some() {
+            std::fs::write(path, &want).unwrap();
+        }
+        let have = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            have == want,
+            "tests/known-ports.json is out of date. Run: UPDATE_KNOWN_PORTS=1 cargo test known_ports"
+        );
+    }
 
     #[test]
     fn only_presets_the_app_could_have_saved_are_listed() {

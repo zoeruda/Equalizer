@@ -158,6 +158,63 @@ def band(kind, freq, gain, q):
     return {"kind": kind, "freq": freq, "gain": gain, "q": q, "enabled": True}
 
 
+print("The plugin's controls are all known")
+# A control the app doesn't set gets a default nobody chose, and two of those were bugs:
+# the equalizer's analyzer and Loudness's FFT mode. tests/known-ports.json lists every
+# control the app sets or leaves on purpose (from LEFT_AT_DEFAULT in src/model.rs), so a
+# control that an LSP update adds or renames fails here until someone has looked at it.
+
+
+def plugin_file():
+    home = os.path.expanduser("~")
+    dirs = [d for d in os.environ.get("LADSPA_PATH", "").split(":") if d]
+    dirs += [f"{home}/.local/lib/ladspa", f"{home}/.ladspa", "/usr/lib64/ladspa", "/usr/lib/ladspa", "/usr/local/lib/ladspa",
+             "/app/lib/ladspa", "/usr/lib/x86_64-linux-gnu/ladspa"]
+    return next((p for p in (os.path.join(d, "lsp-plugins-ladspa.so") for d in dirs) if os.path.exists(p)), None)
+
+
+def control_inputs(path):
+    """Each LSP plugin's control inputs, read from the file's LADSPA descriptors."""
+    import ctypes as C
+
+    class Descriptor(C.Structure):
+        _fields_ = [("UniqueID", C.c_ulong), ("Label", C.c_char_p), ("Properties", C.c_int), ("Name", C.c_char_p),
+                    ("Maker", C.c_char_p), ("Copyright", C.c_char_p), ("PortCount", C.c_ulong),
+                    ("PortDescriptors", C.POINTER(C.c_int)), ("PortNames", C.POINTER(C.c_char_p))]
+
+    get = C.CDLL(path).ladspa_descriptor
+    get.restype, get.argtypes = C.POINTER(Descriptor), [C.c_ulong]
+    found, i = {}, 0
+    while d := get(i):
+        d, i = d.contents, i + 1
+        # 1 is an input and 4 a control (LADSPA_PORT_INPUT, LADSPA_PORT_CONTROL).
+        found[d.Label.decode().rsplit("/", 1)[-1]] = {d.PortNames[n].decode() for n in range(d.PortCount) if d.PortDescriptors[n] & 5 == 5}
+    return found
+
+
+known = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "known-ports.json")))
+lsp = plugin_file()
+if not lsp:
+    print("  FAIL couldn't find lsp-plugins-ladspa.so")
+    fails.append("plugin file")
+else:
+    has = control_inputs(lsp)
+    for plugin, ports in sorted(known.items()):
+        there = has.get(plugin, set())
+        new = sorted(there - set(ports))
+        gone = sorted(p for p, why in ports.items() if p not in there and why == "set by the app")
+        unused = sorted(p for p, why in ports.items() if p not in there and why != "set by the app")
+        ok = bool(there) and not new and not gone
+        print(f"  {'ok  ' if ok else 'FAIL'} {plugin}: {len(there)} controls" + ("" if there else ", so the plugin is missing"))
+        for p in new:
+            print(f"         “{p}” isn't known: the app neither sets it nor lists it in LEFT_AT_DEFAULT")
+        for p in gone:
+            print(f"         “{p}” is set by the app, and the plugin doesn't have it")
+        if unused:
+            print(f"         not in this plugin, which is fine: {', '.join(unused)}")
+        if not ok:
+            fails.append(f"{plugin}'s controls are known")
+
 print("Filters: the graph's curve vs. measured audio")
 for kind, f0, gain, q, probes in [
     ("Bell", 1000.0, 9.0, 1.4, [250, 700, 1000, 1400, 4000]),
@@ -360,6 +417,48 @@ for label, mutate in [("the defaults (limiter on)", with_effects("limiter")), ("
         print(f"  {'ok  ' if ok else 'FAIL'} {label}: the app adds {added:.1f} ms, {unreported:.1f} ms of it not reported (at most 20)")
         if not ok:
             fails.append(f"sound stays in time, {label}")
+
+print("Each effect on its own, at neutral settings")
+# An effect that's on and set to do nothing must change neither the level nor the delay.
+# A plugin control the app leaves at its default can break either one, as Loudness's FFT
+# mode did. The tone is at Auto Gain's target, so that has nothing to correct either.
+
+
+def neutral(name):
+    def mutate(s):
+        s["bands"] = []
+        if name == "eq":
+            s["bands"] = [band("Bell", 1000.0, 0.0, 1.0), band("LowShelf", 100.0, 0.0, 0.7), band("HighShelf", 8000.0, 0.0, 0.7)]
+            return
+        s["effects"][name]["enabled"] = True
+        s["effects"][name]["params"].update({
+            "autogain": {"target": LEVEL_DB},
+            "compressor": {"ratio": 1.0, "makeup": 0.0},
+            "loudness": {"amount": 0.0},
+            "limiter": {},
+        }[name])
+    return mutate
+
+
+with App(lambda s: s.update(bands=[])):
+    off = {f: measure(f, seconds=3.0) for f in (60, 1000, 8000)}
+    off_delay = click_delay("equalizer_sink")
+for name in ["autogain", "compressor", "eq", "loudness", "limiter"]:
+    with App(neutral(name)):
+        for f in (60, 1000, 8000):
+            # Auto Gain measures loudness as the ear hears it, so only 1 kHz is at its target.
+            if name == "autogain" and f != 1000:
+                continue
+            check(f"{name} on, doing nothing, at {f} Hz", measure(f, seconds=3.0) - off[f], 0.0, tol=0.5)
+        delay = click_delay("equalizer_sink")
+        if delay is None or off_delay is None:
+            print(f"  FAIL {name}: couldn't hear the clicks")
+            fails.append(f"{name} on its own adds no delay")
+            continue
+        ok = abs(delay - off_delay) <= 5
+        print(f"  {'ok  ' if ok else 'FAIL'} {name} on adds {delay - off_delay:+.1f} ms (at most 5)")
+        if not ok:
+            fails.append(f"{name} on its own adds no delay")
 
 print("Bluetooth headphones' late volume reports")
 # After a volume change, Bluetooth headphones report the volume they had once more, a
