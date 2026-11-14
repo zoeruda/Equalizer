@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_BANDS: usize = 32;
 pub const GAIN_LIMIT: f64 = 24.0;
+/// The preamp goes up to what the plugin's "Input gain" can do, which is less than a band's
+/// gain. PipeWire limits a control to its range, so anything above would play as +20.
+pub const PREAMP_MAX: f64 = 20.0;
 pub const SINK_NAME: &str = "equalizer_sink";
 pub const SOURCE_NAME: &str = "equalizer_source";
 
@@ -158,7 +161,8 @@ pub static EFFECTS: &[EffectSpec] = &[
                 "threshold",
                 "Threshold",
                 "Sound below this level is turned down",
-                -80.0,
+                // As far as the oldest plugin the app runs on goes (Fedora 42's). Newer ones reach -96.
+                -60.0,
                 0.0,
                 false,
                 "dB",
@@ -169,7 +173,8 @@ pub static EFFECTS: &[EffectSpec] = &[
                 "reduction",
                 "Reduction",
                 "How far quiet sound is turned down",
-                -80.0,
+                // As far as the plugin goes.
+                -72.0,
                 0.0,
                 false,
                 "dB",
@@ -199,7 +204,15 @@ pub static EFFECTS: &[EffectSpec] = &[
                 Map::Raw("Release (ms)"),
             ),
         ],
-        fixed: &[("Sidechain mode", 1.0)],
+        // Every control that shapes the sound is set here. One that's left alone gets a
+        // value worked out from the plugin's range, which has changed between versions.
+        fixed: &[
+            ("Sidechain mode", 1.0), // RMS
+            // The time the RMS level is taken over, as LSP has it. At 0, RMS reads peaks.
+            ("Sidechain reactivity (ms)", 10.0),
+            // -6 dB, as LSP has it: the gate is fully closed 6 dB under the threshold.
+            ("Curve zone size (G)", 0.50119),
+        ],
     },
     EffectSpec {
         id: "autogain",
@@ -233,7 +246,22 @@ pub static EFFECTS: &[EffectSpec] = &[
                 Map::Raw("The maximum amplification gain (dB)"),
             ),
         ],
-        fixed: &[("Enable maximum amplification gain limitation", 1.0)],
+        fixed: &[
+            ("Enable maximum amplification gain limitation", 1.0),
+            // The timings Auto Gain was tuned by ear with, up to 0.0.7. They aren't LSP's
+            // own, which are a little slower: they're what PipeWire worked out from the
+            // plugin's ranges while the app left them alone.
+            ("Loudness measuring long period (ms)", 447.214),
+            ("Loudness measuring short period (ms)", 22.3607),
+            ("Long gain grow amount", 6.0), // 10 dB
+            ("Long gain grow time (ms)", 316.228),
+            ("Long gain fall amount", 6.0),
+            ("Long gain fall time (ms)", 316.228),
+            ("Short gain grow amount", 6.0),
+            ("Short gain grow time (ms)", 22.3607),
+            ("Short gain fall amount", 6.0),
+            ("Short gain fall time (ms)", 8.94427),
+        ],
     },
     EffectSpec {
         id: "compressor",
@@ -311,7 +339,12 @@ pub static EFFECTS: &[EffectSpec] = &[
                 Map::Gain("Makeup gain (G)"),
             ),
         ],
-        fixed: &[("Compression mode", 0.0), ("Sidechain mode", 1.0)],
+        fixed: &[
+            ("Compression mode", 0.0),
+            ("Sidechain mode", 1.0), // RMS
+            // The time the RMS level is taken over, as LSP has it. At 0, RMS reads peaks.
+            ("Sidechain reactivity (ms)", 10.0),
+        ],
     },
     EffectSpec {
         id: "loudness",
@@ -386,6 +419,9 @@ pub static EFFECTS: &[EffectSpec] = &[
             ("Gain boost", 0.0),
             ("Attack time (ms)", 1.0),
             ("Automatic level regulation", 0.0),
+            // What it has been up to 0.0.7, by the plugin's range. LSP has -5. No
+            // difference could be measured on tones.
+            ("Knee smooth (dB)", -12.0),
         ],
     },
 ];
@@ -484,7 +520,7 @@ impl Sound {
             band.gain = limited(band.gain, -GAIN_LIMIT, GAIN_LIMIT, 0.0);
             band.q = limited(band.q, 0.1, 20.0, 1.0);
         }
-        self.preamp = limited(self.preamp, -GAIN_LIMIT, GAIN_LIMIT, 0.0);
+        self.preamp = limited(self.preamp, -GAIN_LIMIT, PREAMP_MAX, 0.0);
         self.balance = limited(self.balance, -100.0, 100.0, 0.0);
         for spec in EFFECTS {
             let Some(state) = self.effects.get_mut(spec.id) else { continue };
@@ -937,7 +973,10 @@ pub fn parse_apo(text: &str) -> Result<Sound, String> {
 ///
 /// `tests/measure.py` fails when the installed plugin has a control that's neither set by
 /// the app nor listed here, so a new or renamed control in an LSP update gets looked at.
-/// It reads `tests/known-ports.json`, which a test below keeps the same as this list.
+/// It reads `tests/known-ports.json`, which a test below keeps the same as this list. For a
+/// control the app sets, the file has the lowest and highest value the app can send, and
+/// `tests/measure.py` fails when the plugin's own range is narrower: PipeWire limits a
+/// control to its range, so the end of a slider would do nothing.
 #[cfg(test)]
 static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
     ("gate_stereo", "Show pre-mix overlay", "Only for the plugin's own window"),
@@ -976,11 +1015,6 @@ static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
         "Off. On would play the sidechain in place of the sound",
     ),
     ("gate_stereo", "Sidechain source", "0: the middle of left and right"),
-    (
-        "gate_stereo",
-        "Sidechain reactivity (ms)",
-        "0 by the hint, LSP has 10: RMS acts as peak. Open: 0.0.8 Part 1, found 1",
-    ),
     ("gate_stereo", "Sidechain preamp (G)", "No change in the sidechain's level"),
     ("gate_stereo", "High-pass filter mode", "Off: the sidechain isn't filtered"),
     (
@@ -995,11 +1029,6 @@ static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
         "Not read with the sidechain filter off",
     ),
     ("gate_stereo", "Hysteresis", "Off"),
-    (
-        "gate_stereo",
-        "Curve zone size (G)",
-        "-15 dB by the hint, where LSP has -6. Open: 0.0.8 Part 1, found 2",
-    ),
     ("gate_stereo", "Hysteresis threshold (G)", "Not read with Hysteresis off"),
     ("gate_stereo", "Hysteresis zone size (G)", "Not read with Hysteresis off"),
     ("gate_stereo", "Hold time (ms)", "0: no hold"),
@@ -1040,62 +1069,12 @@ static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
     ),
     (
         "autogain_stereo",
-        "Loudness measuring long period (ms)",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Loudness measuring short period (ms)",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
         "Weighting function",
         "5: K-weighting, which LUFS is measured with",
     ),
     ("autogain_stereo", "Level drift (dB)", "12, as LSP has it"),
     ("autogain_stereo", "The level of silence (LUFS)", "-72, as LSP has it"),
     ("autogain_stereo", "Enable quick amplifier", "Off, as LSP has it"),
-    (
-        "autogain_stereo",
-        "Long gain grow amount",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Long gain grow time (ms)",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Long gain fall amount",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Long gain fall time (ms)",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Short gain grow amount",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Short gain grow time (ms)",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Short gain fall amount",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
-    (
-        "autogain_stereo",
-        "Short gain fall time (ms)",
-        "By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    ),
     ("autogain_stereo", "Input metering enable for long period", "A meter nothing reads"),
     ("autogain_stereo", "Input metering enable for short period", "A meter nothing reads"),
     ("autogain_stereo", "Output metering enable for long period", "A meter nothing reads"),
@@ -1141,11 +1120,6 @@ static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
         "Off. On would play the sidechain in place of the sound",
     ),
     ("compressor_stereo", "Sidechain source", "0: the middle of left and right"),
-    (
-        "compressor_stereo",
-        "Sidechain reactivity (ms)",
-        "0 by the hint, LSP has 10: RMS acts as peak. Open: 0.0.8 Part 1, found 1",
-    ),
     ("compressor_stereo", "Sidechain preamp (G)", "No change in the sidechain's level"),
     ("compressor_stereo", "High-pass filter mode", "Off: the sidechain isn't filtered"),
     (
@@ -1285,6 +1259,11 @@ static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
     ("loud_comp_stereo", "Hard-clipping range (dB)", "Not read with hard-clipping off"),
     (
         "loud_comp_stereo",
+        "Compensate gain shift",
+        "Off, as before LSP 1.2.37 added it. Older plugins don't have it",
+    ),
+    (
+        "loud_comp_stereo",
         "Clean hard-clipping indicators",
         "Only for the plugin's own window",
     ),
@@ -1353,32 +1332,61 @@ static LEFT_AT_DEFAULT: &[(&str, &str, &str)] = &[
         "Only for the plugin's own window",
     ),
     ("limiter_stereo", "Gain graph visibility Right", "Only for the plugin's own window"),
-    (
-        "limiter_stereo",
-        "Knee smooth (dB)",
-        "-12 by the hint, where LSP has -5. Open: 0.0.8 Part 1, found 4",
-    ),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Each plugin's controls: the ones the app sets, and the ones it leaves, with why.
-    fn known_ports() -> BTreeMap<String, BTreeMap<String, String>> {
-        let mut known: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        let mut full = Sound::flat();
-        full.bands = (0..MAX_BANDS).map(|i| Band::bell(100.0 + i as f64, 0.0, 1.0)).collect();
-        for dir in [Direction::Output, Direction::Mic] {
-            for (key, _) in plugin_controls(&full, dir) {
-                let (id, port) = key.split_once(':').expect("node:control");
-                let plugin = if id == "eq" {
-                    "para_equalizer_x32_stereo"
-                } else {
-                    effect(id).plugin
-                };
-                known.entry(plugin.into()).or_default().insert(port.into(), "set by the app".into());
+    /// Sounds at both ends of everything `sanitize` lets through, with the effects on and off.
+    fn extreme_sounds() -> Vec<Sound> {
+        let mut sounds = vec![Sound::flat()];
+        for end in [-1e9, 1e9] {
+            for (n, kind) in FilterKind::ALL.into_iter().enumerate() {
+                let mut s = Sound::flat();
+                s.eq_enabled = n % 2 == 0;
+                s.preamp = end;
+                s.balance = end;
+                s.bands = vec![Band::bell(end, end, end); MAX_BANDS];
+                s.bands.iter_mut().for_each(|b| b.kind = kind);
+                for spec in EFFECTS {
+                    let state = s.effects.get_mut(spec.id).unwrap();
+                    state.enabled = n % 2 == 0;
+                    for param in spec.params {
+                        state.params.insert(param.id.into(), end);
+                    }
+                }
+                s.sanitize();
+                sounds.push(s);
             }
+        }
+        sounds
+    }
+
+    /// Each plugin's controls: the ones the app sets, with the lowest and highest value
+    /// it can send, and the ones it leaves, with why.
+    fn known_ports() -> BTreeMap<String, BTreeMap<String, serde_json::Value>> {
+        let mut sent: BTreeMap<(String, String), (f32, f32)> = BTreeMap::new();
+        for sound in extreme_sounds() {
+            for dir in [Direction::Output, Direction::Mic] {
+                for (key, v) in plugin_controls(&sound, dir) {
+                    let (id, port) = key.split_once(':').expect("node:control");
+                    let plugin = if id == "eq" {
+                        "para_equalizer_x32_stereo"
+                    } else {
+                        effect(id).plugin
+                    };
+                    let range = sent.entry((plugin.into(), port.into())).or_insert((v, v));
+                    *range = (range.0.min(v), range.1.max(v));
+                }
+            }
+        }
+        let mut known: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+        // Written as the shortest number that reads back as the same f32.
+        let short = |v: f32| v.to_string().parse::<f64>().unwrap();
+        for ((plugin, port), (min, max)) in sent {
+            let range = serde_json::json!({ "min": short(min), "max": short(max) });
+            known.entry(plugin).or_default().insert(port, range);
         }
         for (plugin, port, why) in LEFT_AT_DEFAULT {
             let numbers = if port.contains("{n}") { MAX_BANDS } else { 1 };
@@ -1387,7 +1395,7 @@ mod tests {
                 let before = known
                     .entry(plugin.to_string())
                     .or_default()
-                    .insert(port.clone(), format!("left: {why}"));
+                    .insert(port.clone(), format!("left: {why}").into());
                 assert_eq!(before, None, "{plugin}: “{port}” is listed twice, or is set by the app too");
             }
         }
@@ -1445,7 +1453,7 @@ mod tests {
     #[test]
     fn apo_import_limits_extreme_values() {
         let s = parse_apo("Preamp: 500 dB\nFilter 1: ON PK Fc 99999 Hz Gain -500 dB Q 900\n").unwrap();
-        assert_eq!(s.preamp, GAIN_LIMIT);
+        assert_eq!(s.preamp, PREAMP_MAX);
         assert_eq!(s.bands[0], Band::bell(24_000.0, -GAIN_LIMIT, 20.0));
     }
 
@@ -1475,7 +1483,7 @@ mod tests {
 
         s.sanitize();
 
-        assert_eq!(s.preamp, GAIN_LIMIT);
+        assert_eq!(s.preamp, PREAMP_MAX);
         assert_eq!(s.balance, 0.0);
         assert_eq!(s.bands.len(), MAX_BANDS);
         assert_eq!(s.bands[0], Band::bell(1000.0, 0.0, 0.1));

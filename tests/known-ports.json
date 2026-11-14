@@ -1,42 +1,96 @@
 {
   "autogain_stereo": {
-    "Bypass": "set by the app",
-    "Desired loudness level (LUFS)": "set by the app",
-    "Enable maximum amplification gain limitation": "set by the app",
+    "Bypass": {
+      "max": 1.0,
+      "min": 0.0
+    },
+    "Desired loudness level (LUFS)": {
+      "max": -6.0,
+      "min": -48.0
+    },
+    "Enable maximum amplification gain limitation": {
+      "max": 1.0,
+      "min": 1.0
+    },
     "Enable quick amplifier": "left: Off, as LSP has it",
     "Gain correction metering": "left: A meter nothing reads",
     "Input metering enable for long period": "left: A meter nothing reads",
     "Input metering enable for short period": "left: A meter nothing reads",
     "Level drift (dB)": "left: 12, as LSP has it",
-    "Long gain fall amount": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Long gain fall time (ms)": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Long gain grow amount": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Long gain grow time (ms)": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Loudness measuring long period (ms)": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Loudness measuring short period (ms)": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    "Long gain fall amount": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Long gain fall time (ms)": {
+      "max": 316.228,
+      "min": 316.228
+    },
+    "Long gain grow amount": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Long gain grow time (ms)": {
+      "max": 316.228,
+      "min": 316.228
+    },
+    "Loudness measuring long period (ms)": {
+      "max": 447.214,
+      "min": 447.214
+    },
+    "Loudness measuring short period (ms)": {
+      "max": 22.3607,
+      "min": 22.3607
+    },
     "Output metering enable for long period": "left: A meter nothing reads",
     "Output metering enable for short period": "left: A meter nothing reads",
-    "Short gain fall amount": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Short gain fall time (ms)": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Short gain grow amount": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
-    "Short gain grow time (ms)": "left: By the hint, not LSP's value. Open: 0.0.8 Part 1, found 3",
+    "Short gain fall amount": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Short gain fall time (ms)": {
+      "max": 8.94427,
+      "min": 8.94427
+    },
+    "Short gain grow amount": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Short gain grow time (ms)": {
+      "max": 22.3607,
+      "min": 22.3607
+    },
     "Sidechain lookahead (ms)": "left: 0. Anything else delays the sound by as much",
     "Sidechain metering enable for long period": "left: A meter nothing reads",
     "Sidechain metering enable for short period": "left: A meter nothing reads",
     "Sidechain mode": "left: 0: it listens to its own input",
     "Sidechain preamp (dB)": "left: No change in the sidechain's level",
     "The level of silence (LUFS)": "left: -72, as LSP has it",
-    "The maximum amplification gain (dB)": "set by the app",
+    "The maximum amplification gain (dB)": {
+      "max": 40.0,
+      "min": 0.0
+    },
     "Weighting function": "left: 5: K-weighting, which LUFS is measured with"
   },
   "compressor_stereo": {
-    "Attack threshold (G)": "set by the app",
-    "Attack time (ms)": "set by the app",
+    "Attack threshold (G)": {
+      "max": 1.0,
+      "min": 0.001
+    },
+    "Attack time (ms)": {
+      "max": 200.0,
+      "min": 0.1
+    },
     "Boost signal amount (G)": "left: Not read in the downward mode",
     "Boost threshold (G)": "left: Not read in the downward mode",
-    "Bypass": "set by the app",
+    "Bypass": {
+      "max": 1.0,
+      "min": 0.0
+    },
     "Clear graph analysis": "left: Only for the plugin's own window",
-    "Compression mode": "set by the app",
+    "Compression mode": {
+      "max": 0.0,
+      "min": 0.0
+    },
     "Dry gain (G)": "left: Only the processed sound comes out",
     "Dry/Wet balance (%)": "left: Only the processed sound comes out",
     "Envelope level visibility Left": "left: Only for the plugin's own window",
@@ -50,19 +104,31 @@
     "Input level visibility Left": "left: Only for the plugin's own window",
     "Input level visibility Right": "left: Only for the plugin's own window",
     "Input to Link mix (G)": "left: 0: nothing is mixed in from the unconnected link input",
-    "Knee (G)": "set by the app",
+    "Knee (G)": {
+      "max": 1.0,
+      "min": 0.06309573
+    },
     "Link to Input mix (G)": "left: 0: nothing is mixed in from the unconnected link input",
     "Link to Sidechain mix (G)": "left: 0: nothing is mixed in from the unconnected link input",
     "Low-pass filter frequency (Hz)": "left: Not read with the sidechain filter off",
     "Low-pass filter mode": "left: Off: the sidechain isn't filtered",
-    "Makeup gain (G)": "set by the app",
+    "Makeup gain (G)": {
+      "max": 15.848932,
+      "min": 1.0
+    },
     "Output gain (G)": "left: 1: no change in level",
     "Output level visibility Left": "left: Only for the plugin's own window",
     "Output level visibility Right": "left: Only for the plugin's own window",
     "Pause graph analysis": "left: Only for the plugin's own window",
-    "Ratio": "set by the app",
+    "Ratio": {
+      "max": 20.0,
+      "min": 1.0
+    },
     "Release threshold (G)": "left: 0: the release doesn't depend on the level, as LSP has it",
-    "Release time (ms)": "set by the app",
+    "Release time (ms)": {
+      "max": 2000.0,
+      "min": 5.0
+    },
     "Show mix overlay": "left: Only for the plugin's own window",
     "Show pre-mix overlay": "left: Only for the plugin's own window",
     "Show sidechain overlay": "left: Only for the plugin's own window",
@@ -70,9 +136,15 @@
     "Sidechain level visibility Right": "left: Only for the plugin's own window",
     "Sidechain listen": "left: Off. On would play the sidechain in place of the sound",
     "Sidechain lookahead (ms)": "left: 0. Anything else delays the sound by as much",
-    "Sidechain mode": "set by the app",
+    "Sidechain mode": {
+      "max": 1.0,
+      "min": 1.0
+    },
     "Sidechain preamp (G)": "left: No change in the sidechain's level",
-    "Sidechain reactivity (ms)": "left: 0 by the hint, LSP has 10: RMS acts as peak. Open: 0.0.8 Part 1, found 1",
+    "Sidechain reactivity (ms)": {
+      "max": 10.0,
+      "min": 10.0
+    },
     "Sidechain source": "left: 0: the middle of left and right",
     "Sidechain type": "left: 0: feed-forward, from its own input",
     "Split sidechain source": "left: Not read with Stereo split off",
@@ -80,11 +152,23 @@
     "Wet gain (G)": "left: Only the processed sound comes out"
   },
   "gate_stereo": {
-    "Attack (ms)": "set by the app",
-    "Bypass": "set by the app",
+    "Attack (ms)": {
+      "max": 200.0,
+      "min": 0.1
+    },
+    "Bypass": {
+      "max": 1.0,
+      "min": 0.0
+    },
     "Clear graph analysis": "left: Only for the plugin's own window",
-    "Curve threshold (G)": "set by the app",
-    "Curve zone size (G)": "left: -15 dB by the hint, where LSP has -6. Open: 0.0.8 Part 1, found 2",
+    "Curve threshold (G)": {
+      "max": 1.0,
+      "min": 0.001
+    },
+    "Curve zone size (G)": {
+      "max": 0.50119,
+      "min": 0.50119
+    },
     "Dry gain (G)": "left: Only the processed sound comes out",
     "Dry/Wet balance (%)": "left: Only the processed sound comes out",
     "Envelope level visibility Left": "left: Only for the plugin's own window",
@@ -110,8 +194,14 @@
     "Output level visibility Left": "left: Only for the plugin's own window",
     "Output level visibility Right": "left: Only for the plugin's own window",
     "Pause graph analysis": "left: Only for the plugin's own window",
-    "Reduction (G)": "set by the app",
-    "Release (ms)": "set by the app",
+    "Reduction (G)": {
+      "max": 1.0,
+      "min": 0.00025118864
+    },
+    "Release (ms)": {
+      "max": 2000.0,
+      "min": 5.0
+    },
     "Show mix overlay": "left: Only for the plugin's own window",
     "Show pre-mix overlay": "left: Only for the plugin's own window",
     "Show sidechain overlay": "left: Only for the plugin's own window",
@@ -120,23 +210,41 @@
     "Sidechain level visibility Right": "left: Only for the plugin's own window",
     "Sidechain listen": "left: Off. On would play the sidechain in place of the sound",
     "Sidechain lookahead (ms)": "left: 0. Anything else delays the sound by as much",
-    "Sidechain mode": "set by the app",
+    "Sidechain mode": {
+      "max": 1.0,
+      "min": 1.0
+    },
     "Sidechain preamp (G)": "left: No change in the sidechain's level",
-    "Sidechain reactivity (ms)": "left: 0 by the hint, LSP has 10: RMS acts as peak. Open: 0.0.8 Part 1, found 1",
+    "Sidechain reactivity (ms)": {
+      "max": 10.0,
+      "min": 10.0
+    },
     "Sidechain source": "left: 0: the middle of left and right",
     "Split sidechain source": "left: Not read with Stereo split off",
     "Stereo split": "left: Off: left and right are processed together",
     "Wet gain (G)": "left: Only the processed sound comes out"
   },
   "limiter_stereo": {
-    "Attack time (ms)": "set by the app",
-    "Automatic level regulation": "set by the app",
+    "Attack time (ms)": {
+      "max": 1.0,
+      "min": 1.0
+    },
+    "Automatic level regulation": {
+      "max": 0.0,
+      "min": 0.0
+    },
     "Automatic level regulation attack time (ms)": "left: Not read with Automatic level regulation off",
     "Automatic level regulation release time (ms)": "left: Not read with Automatic level regulation off",
-    "Bypass": "set by the app",
+    "Bypass": {
+      "max": 1.0,
+      "min": 0.0
+    },
     "Clear graph analysis": "left: Only for the plugin's own window",
     "Dithering": "left: 0: none",
-    "Gain boost": "set by the app",
+    "Gain boost": {
+      "max": 0.0,
+      "min": 0.0
+    },
     "Gain graph visibility Left": "left: Only for the plugin's own window",
     "Gain graph visibility Right": "left: Only for the plugin's own window",
     "Input gain (G)": "left: 1: no change in level",
@@ -144,43 +252,77 @@
     "Input graph visibility Right": "left: Only for the plugin's own window",
     "Input to Link mix (G)": "left: 0: nothing is mixed in from the unconnected link input",
     "Knee level (G)": "left: 1: 0 dB, as LSP has it",
-    "Knee smooth (dB)": "left: -12 by the hint, where LSP has -5. Open: 0.0.8 Part 1, found 4",
+    "Knee smooth (dB)": {
+      "max": -12.0,
+      "min": -12.0
+    },
     "Link to Input mix (G)": "left: 0: nothing is mixed in from the unconnected link input",
     "Link to Sidechain mix (G)": "left: 0: nothing is mixed in from the unconnected link input",
-    "Lookahead (ms)": "set by the app",
-    "Operating mode": "set by the app",
+    "Lookahead (ms)": {
+      "max": 20.0,
+      "min": 0.25
+    },
+    "Operating mode": {
+      "max": 1.0,
+      "min": 1.0
+    },
     "Output gain (G)": "left: 1: no change in level",
     "Output graph visibility Left": "left: Only for the plugin's own window",
     "Output graph visibility Right": "left: Only for the plugin's own window",
     "Oversampling": "left: 0: none. Anything else adds delay",
     "Pause graph analysis": "left: Only for the plugin's own window",
-    "Release time (ms)": "set by the app",
+    "Release time (ms)": {
+      "max": 20.0,
+      "min": 0.25
+    },
     "Show pre-mix overlay": "left: Only for the plugin's own window",
     "Sidechain graph visibility Left": "left: Only for the plugin's own window",
     "Sidechain graph visibility Right": "left: Only for the plugin's own window",
     "Sidechain preamp (G)": "left: No change in the sidechain's level",
     "Sidechain type": "left: 0: it listens to its own input",
     "Stereo linking (%)": "left: 100: left and right are turned down together",
-    "Threshold (G)": "set by the app"
+    "Threshold (G)": {
+      "max": 1.0,
+      "min": 0.06309573
+    }
   },
   "loud_comp_stereo": {
-    "Bypass": "set by the app",
+    "Bypass": {
+      "max": 1.0,
+      "min": 0.0
+    },
     "Clean hard-clipping indicators": "left: Only for the plugin's own window",
+    "Compensate gain shift": "left: Off, as before LSP 1.2.37 added it. Older plugins don't have it",
     "Enable reference generator": "left: Off. On would play a test signal",
     "Equalization curve is shown relative to the volume": "left: Only for the plugin's own window",
     "FFT size": "left: Not read in IIR mode",
     "Hard-clipping enable": "left: Off: the limiter comes after",
     "Hard-clipping range (dB)": "left: Not read with hard-clipping off",
-    "IIR approximation": "set by the app",
-    "Input gain (G)": "set by the app",
+    "IIR approximation": {
+      "max": 2.0,
+      "min": 2.0
+    },
+    "Input gain (G)": {
+      "max": 100.0,
+      "min": 1.0
+    },
     "Loudness contour standard": "left: 4: ISO 226:2023, LSP's own default",
-    "Output volume (dB)": "set by the app",
-    "Processing mode": "set by the app",
+    "Output volume (dB)": {
+      "max": -0.0,
+      "min": -40.0
+    },
+    "Processing mode": {
+      "max": 1.0,
+      "min": 1.0
+    },
     "Type of reference generator": "left: Not read with the generator off"
   },
   "para_equalizer_x32_stereo": {
     "Automatically inspect filter when editing": "left: Only for the plugin's own window",
-    "Bypass": "set by the app",
+    "Bypass": {
+      "max": 1.0,
+      "min": 0.0
+    },
     "Equalizer decramping": "left: 0: off, as LSP has it",
     "Equalizer mode": "left: 0: IIR. The other modes delay the sound by 85 to 128 ms",
     "FFT reactivity (ms)": "left: Only for the plugin's own window",
@@ -216,38 +358,134 @@
     "Filter Width 7 (oct)": "left: Not read by the filter types the app uses",
     "Filter Width 8 (oct)": "left: Not read by the filter types the app uses",
     "Filter Width 9 (oct)": "left: Not read by the filter types the app uses",
-    "Filter mode 0": "set by the app",
-    "Filter mode 1": "set by the app",
-    "Filter mode 10": "set by the app",
-    "Filter mode 11": "set by the app",
-    "Filter mode 12": "set by the app",
-    "Filter mode 13": "set by the app",
-    "Filter mode 14": "set by the app",
-    "Filter mode 15": "set by the app",
-    "Filter mode 16": "set by the app",
-    "Filter mode 17": "set by the app",
-    "Filter mode 18": "set by the app",
-    "Filter mode 19": "set by the app",
-    "Filter mode 2": "set by the app",
-    "Filter mode 20": "set by the app",
-    "Filter mode 21": "set by the app",
-    "Filter mode 22": "set by the app",
-    "Filter mode 23": "set by the app",
-    "Filter mode 24": "set by the app",
-    "Filter mode 25": "set by the app",
-    "Filter mode 26": "set by the app",
-    "Filter mode 27": "set by the app",
-    "Filter mode 28": "set by the app",
-    "Filter mode 29": "set by the app",
-    "Filter mode 3": "set by the app",
-    "Filter mode 30": "set by the app",
-    "Filter mode 31": "set by the app",
-    "Filter mode 4": "set by the app",
-    "Filter mode 5": "set by the app",
-    "Filter mode 6": "set by the app",
-    "Filter mode 7": "set by the app",
-    "Filter mode 8": "set by the app",
-    "Filter mode 9": "set by the app",
+    "Filter mode 0": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 1": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 10": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 11": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 12": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 13": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 14": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 15": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 16": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 17": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 18": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 19": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 2": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 20": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 21": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 22": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 23": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 24": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 25": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 26": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 27": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 28": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 29": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 3": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 30": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 31": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 4": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 5": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 6": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 7": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 8": {
+      "max": 6.0,
+      "min": 6.0
+    },
+    "Filter mode 9": {
+      "max": 6.0,
+      "min": 6.0
+    },
     "Filter mute 0": "left: Off",
     "Filter mute 1": "left: Off",
     "Filter mute 10": "left: Off",
@@ -345,103 +583,391 @@
     "Filter solo 7": "left: Off",
     "Filter solo 8": "left: Off",
     "Filter solo 9": "left: Off",
-    "Filter type 0": "set by the app",
-    "Filter type 1": "set by the app",
-    "Filter type 10": "set by the app",
-    "Filter type 11": "set by the app",
-    "Filter type 12": "set by the app",
-    "Filter type 13": "set by the app",
-    "Filter type 14": "set by the app",
-    "Filter type 15": "set by the app",
-    "Filter type 16": "set by the app",
-    "Filter type 17": "set by the app",
-    "Filter type 18": "set by the app",
-    "Filter type 19": "set by the app",
-    "Filter type 2": "set by the app",
-    "Filter type 20": "set by the app",
-    "Filter type 21": "set by the app",
-    "Filter type 22": "set by the app",
-    "Filter type 23": "set by the app",
-    "Filter type 24": "set by the app",
-    "Filter type 25": "set by the app",
-    "Filter type 26": "set by the app",
-    "Filter type 27": "set by the app",
-    "Filter type 28": "set by the app",
-    "Filter type 29": "set by the app",
-    "Filter type 3": "set by the app",
-    "Filter type 30": "set by the app",
-    "Filter type 31": "set by the app",
-    "Filter type 4": "set by the app",
-    "Filter type 5": "set by the app",
-    "Filter type 6": "set by the app",
-    "Filter type 7": "set by the app",
-    "Filter type 8": "set by the app",
-    "Filter type 9": "set by the app",
-    "Frequency 0 (Hz)": "set by the app",
-    "Frequency 1 (Hz)": "set by the app",
-    "Frequency 10 (Hz)": "set by the app",
-    "Frequency 11 (Hz)": "set by the app",
-    "Frequency 12 (Hz)": "set by the app",
-    "Frequency 13 (Hz)": "set by the app",
-    "Frequency 14 (Hz)": "set by the app",
-    "Frequency 15 (Hz)": "set by the app",
-    "Frequency 16 (Hz)": "set by the app",
-    "Frequency 17 (Hz)": "set by the app",
-    "Frequency 18 (Hz)": "set by the app",
-    "Frequency 19 (Hz)": "set by the app",
-    "Frequency 2 (Hz)": "set by the app",
-    "Frequency 20 (Hz)": "set by the app",
-    "Frequency 21 (Hz)": "set by the app",
-    "Frequency 22 (Hz)": "set by the app",
-    "Frequency 23 (Hz)": "set by the app",
-    "Frequency 24 (Hz)": "set by the app",
-    "Frequency 25 (Hz)": "set by the app",
-    "Frequency 26 (Hz)": "set by the app",
-    "Frequency 27 (Hz)": "set by the app",
-    "Frequency 28 (Hz)": "set by the app",
-    "Frequency 29 (Hz)": "set by the app",
-    "Frequency 3 (Hz)": "set by the app",
-    "Frequency 30 (Hz)": "set by the app",
-    "Frequency 31 (Hz)": "set by the app",
-    "Frequency 4 (Hz)": "set by the app",
-    "Frequency 5 (Hz)": "set by the app",
-    "Frequency 6 (Hz)": "set by the app",
-    "Frequency 7 (Hz)": "set by the app",
-    "Frequency 8 (Hz)": "set by the app",
-    "Frequency 9 (Hz)": "set by the app",
+    "Filter type 0": {
+      "max": 6.0,
+      "min": 1.0
+    },
+    "Filter type 1": {
+      "max": 6.0,
+      "min": 1.0
+    },
+    "Filter type 10": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 11": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 12": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 13": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 14": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 15": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 16": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 17": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 18": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 19": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 2": {
+      "max": 6.0,
+      "min": 1.0
+    },
+    "Filter type 20": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 21": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 22": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 23": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 24": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 25": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 26": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 27": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 28": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 29": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 3": {
+      "max": 6.0,
+      "min": 1.0
+    },
+    "Filter type 30": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 31": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 4": {
+      "max": 6.0,
+      "min": 1.0
+    },
+    "Filter type 5": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 6": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 7": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 8": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Filter type 9": {
+      "max": 6.0,
+      "min": 0.0
+    },
+    "Frequency 0 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 1 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 10 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 11 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 12 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 13 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 14 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 15 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 16 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 17 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 18 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 19 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 2 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 20 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 21 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 22 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 23 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 24 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 25 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 26 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 27 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 28 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 29 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 3 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 30 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 31 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 4 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 5 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 6 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 7 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 8 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
+    "Frequency 9 (Hz)": {
+      "max": 24000.0,
+      "min": 10.0
+    },
     "Frequency shift (st)": "left: 0: the bands stay where they're set",
-    "Gain 0 (G)": "set by the app",
-    "Gain 1 (G)": "set by the app",
-    "Gain 10 (G)": "set by the app",
-    "Gain 11 (G)": "set by the app",
-    "Gain 12 (G)": "set by the app",
-    "Gain 13 (G)": "set by the app",
-    "Gain 14 (G)": "set by the app",
-    "Gain 15 (G)": "set by the app",
-    "Gain 16 (G)": "set by the app",
-    "Gain 17 (G)": "set by the app",
-    "Gain 18 (G)": "set by the app",
-    "Gain 19 (G)": "set by the app",
-    "Gain 2 (G)": "set by the app",
-    "Gain 20 (G)": "set by the app",
-    "Gain 21 (G)": "set by the app",
-    "Gain 22 (G)": "set by the app",
-    "Gain 23 (G)": "set by the app",
-    "Gain 24 (G)": "set by the app",
-    "Gain 25 (G)": "set by the app",
-    "Gain 26 (G)": "set by the app",
-    "Gain 27 (G)": "set by the app",
-    "Gain 28 (G)": "set by the app",
-    "Gain 29 (G)": "set by the app",
-    "Gain 3 (G)": "set by the app",
-    "Gain 30 (G)": "set by the app",
-    "Gain 31 (G)": "set by the app",
-    "Gain 4 (G)": "set by the app",
-    "Gain 5 (G)": "set by the app",
-    "Gain 6 (G)": "set by the app",
-    "Gain 7 (G)": "set by the app",
-    "Gain 8 (G)": "set by the app",
-    "Gain 9 (G)": "set by the app",
+    "Gain 0 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 1 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 10 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 11 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 12 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 13 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 14 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 15 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 16 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 17 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 18 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 19 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 2 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 20 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 21 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 22 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 23 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 24 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 25 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 26 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 27 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 28 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 29 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 3 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 30 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 31 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 4 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 5 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 6 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 7 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 8 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
+    "Gain 9 (G)": {
+      "max": 15.848932,
+      "min": 0.06309573
+    },
     "Graph zoom (G)": "left: Only for the plugin's own window",
     "Hue 0": "left: Only for the plugin's own window",
     "Hue 1": "left: Only for the plugin's own window",
@@ -475,50 +1001,170 @@
     "Hue 7": "left: Only for the plugin's own window",
     "Hue 8": "left: Only for the plugin's own window",
     "Hue 9": "left: Only for the plugin's own window",
-    "Input FFT graph enable Left": "set by the app",
-    "Input FFT graph enable Right": "set by the app",
-    "Input gain (G)": "set by the app",
+    "Input FFT graph enable Left": {
+      "max": 0.0,
+      "min": 0.0
+    },
+    "Input FFT graph enable Right": {
+      "max": 0.0,
+      "min": 0.0
+    },
+    "Input gain (G)": {
+      "max": 10.0,
+      "min": 0.06309573
+    },
     "Inspect frequency range (oct)": "left: Only for the plugin's own window",
     "Inspected filter identifier": "left: Only for the plugin's own window",
-    "Output FFT graph enable Left": "set by the app",
-    "Output FFT graph enable Right": "set by the app",
-    "Output balance (%)": "set by the app",
+    "Output FFT graph enable Left": {
+      "max": 0.0,
+      "min": 0.0
+    },
+    "Output FFT graph enable Right": {
+      "max": 0.0,
+      "min": 0.0
+    },
+    "Output balance (%)": {
+      "max": 100.0,
+      "min": -100.0
+    },
     "Output gain (G)": "left: 1: no change in level",
-    "Quality factor 0": "set by the app",
-    "Quality factor 1": "set by the app",
-    "Quality factor 10": "set by the app",
-    "Quality factor 11": "set by the app",
-    "Quality factor 12": "set by the app",
-    "Quality factor 13": "set by the app",
-    "Quality factor 14": "set by the app",
-    "Quality factor 15": "set by the app",
-    "Quality factor 16": "set by the app",
-    "Quality factor 17": "set by the app",
-    "Quality factor 18": "set by the app",
-    "Quality factor 19": "set by the app",
-    "Quality factor 2": "set by the app",
-    "Quality factor 20": "set by the app",
-    "Quality factor 21": "set by the app",
-    "Quality factor 22": "set by the app",
-    "Quality factor 23": "set by the app",
-    "Quality factor 24": "set by the app",
-    "Quality factor 25": "set by the app",
-    "Quality factor 26": "set by the app",
-    "Quality factor 27": "set by the app",
-    "Quality factor 28": "set by the app",
-    "Quality factor 29": "set by the app",
-    "Quality factor 3": "set by the app",
-    "Quality factor 30": "set by the app",
-    "Quality factor 31": "set by the app",
-    "Quality factor 4": "set by the app",
-    "Quality factor 5": "set by the app",
-    "Quality factor 6": "set by the app",
-    "Quality factor 7": "set by the app",
-    "Quality factor 8": "set by the app",
-    "Quality factor 9": "set by the app",
+    "Quality factor 0": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 1": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 10": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 11": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 12": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 13": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 14": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 15": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 16": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 17": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 18": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 19": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 2": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 20": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 21": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 22": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 23": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 24": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 25": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 26": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 27": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 28": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 29": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 3": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 30": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 31": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 4": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 5": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 6": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 7": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 8": {
+      "max": 20.0,
+      "min": 0.1
+    },
+    "Quality factor 9": {
+      "max": 20.0,
+      "min": 0.1
+    },
     "Quantize note frequencies when editing": "left: Only for the plugin's own window",
-    "Return FFT graph enable Left": "set by the app",
-    "Return FFT graph enable Right": "set by the app",
+    "Return FFT graph enable Left": {
+      "max": 0.0,
+      "min": 0.0
+    },
+    "Return FFT graph enable Right": {
+      "max": 0.0,
+      "min": 0.0
+    },
     "Shift gain (G)": "left: Only for the plugin's own window"
   }
 }

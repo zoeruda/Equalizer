@@ -12,7 +12,8 @@ use crate::engine::{self, Cmd, Device, Event};
 use crate::eq_graph;
 use crate::graphs::{self, HISTORY_FLOOR, fmt_db, fmt_freq, fmt_level};
 use crate::model::{
-    self, AppState, Band, Direction, EffectSpec, FilterKind, GAIN_LIMIT, MAX_BANDS, ParamSpec, Plot, Sound, effect, plugin_controls,
+    self, AppState, Band, Direction, EffectSpec, FilterKind, GAIN_LIMIT, MAX_BANDS, PREAMP_MAX, ParamSpec, Plot, Sound, effect,
+    plugin_controls,
 };
 use crate::theme::{self, Rgb};
 
@@ -133,7 +134,9 @@ impl Ctx {
         self.save_at.set(Some(Instant::now() + Duration::from_secs(1)));
     }
 
-    /// Records a change to the sound. The preset name stops applying once edited.
+    /// Records a change to the sound. The preset name stops applying once edited, and
+    /// that includes an effect or the curve switched on or off: a preset saves those too.
+    /// A chain's Active switch isn't part of the sound, and doesn't come through here.
     pub fn edit_sound(&self, dir: Direction, f: impl FnOnce(&mut Sound)) {
         {
             let mut s = self.state.borrow_mut();
@@ -812,7 +815,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
                 label: "Preamp",
                 help: "Turn everything down to leave room for boosts",
                 min: -GAIN_LIMIT,
-                max: GAIN_LIMIT,
+                max: PREAMP_MAX,
                 log: false,
                 unit: "dB",
                 default: 0.0,
@@ -870,7 +873,7 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
         eq_switch.connect_active_notify(move |sw| {
             if !busy2.get() {
                 let on = sw.is_active();
-                ctx2.edit_sound_keep_preset(dir, move |s| s.eq_enabled = on);
+                ctx2.edit_sound(dir, move |s| s.eq_enabled = on);
             }
         });
     }
@@ -894,15 +897,6 @@ fn eq_page(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::ToastOverl
         &right,
         Some(head_extra.upcast_ref()),
     )
-}
-
-impl Ctx {
-    /// For on/off comparisons, which shouldn't make the preset read as "Custom".
-    fn edit_sound_keep_preset(&self, dir: Direction, f: impl FnOnce(&mut Sound)) {
-        f(&mut self.state.borrow_mut().chain_mut(dir).sound);
-        self.mark_changed();
-        self.refresh(dir);
-    }
 }
 
 fn effect_page(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &LiveRef) -> gtk::Box {
@@ -990,7 +984,7 @@ fn effect_page(ctx: &Rc<Ctx>, dir: Direction, spec: &'static EffectSpec, live: &
         sw.connect_active_notify(move |s| {
             if !busy.get() {
                 let on = s.is_active();
-                ctx2.edit_sound_keep_preset(dir, move |snd| {
+                ctx2.edit_sound(dir, move |snd| {
                     if let Some(e) = snd.effects.get_mut(spec.id) {
                         e.enabled = on;
                     }

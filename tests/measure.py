@@ -163,6 +163,9 @@ print("The plugin's controls are all known")
 # the equalizer's analyzer and Loudness's FFT mode. tests/known-ports.json lists every
 # control the app sets or leaves on purpose (from LEFT_AT_DEFAULT in src/model.rs), so a
 # control that an LSP update adds or renames fails here until someone has looked at it.
+# For a control the app sets, the file has the lowest and highest value the app can send.
+# PipeWire limits a control to the plugin's range, so a slider that goes further than the
+# plugin does nothing at its end: the gate's two sliders and the preamp once did.
 
 
 def plugin_file():
@@ -174,13 +177,18 @@ def plugin_file():
 
 
 def control_inputs(path):
-    """Each LSP plugin's control inputs, read from the file's LADSPA descriptors."""
+    """Each LSP plugin's control inputs with their lowest and highest value (None for no
+    limit), read from the file's LADSPA descriptors."""
     import ctypes as C
+
+    class Hint(C.Structure):
+        _fields_ = [("flags", C.c_int), ("lower", C.c_float), ("upper", C.c_float)]
 
     class Descriptor(C.Structure):
         _fields_ = [("UniqueID", C.c_ulong), ("Label", C.c_char_p), ("Properties", C.c_int), ("Name", C.c_char_p),
                     ("Maker", C.c_char_p), ("Copyright", C.c_char_p), ("PortCount", C.c_ulong),
-                    ("PortDescriptors", C.POINTER(C.c_int)), ("PortNames", C.POINTER(C.c_char_p))]
+                    ("PortDescriptors", C.POINTER(C.c_int)), ("PortNames", C.POINTER(C.c_char_p)),
+                    ("PortRangeHints", C.POINTER(Hint))]
 
     get = C.CDLL(path).ladspa_descriptor
     get.restype, get.argtypes = C.POINTER(Descriptor), [C.c_ulong]
@@ -188,7 +196,13 @@ def control_inputs(path):
     while d := get(i):
         d, i = d.contents, i + 1
         # 1 is an input and 4 a control (LADSPA_PORT_INPUT, LADSPA_PORT_CONTROL).
-        found[d.Label.decode().rsplit("/", 1)[-1]] = {d.PortNames[n].decode() for n in range(d.PortCount) if d.PortDescriptors[n] & 5 == 5}
+        ports = found[d.Label.decode().rsplit("/", 1)[-1]] = {}
+        for n in range(d.PortCount):
+            if d.PortDescriptors[n] & 5 == 5:
+                h = d.PortRangeHints[n]
+                # 1: there's a lower limit, 2: an upper one, 8: both are in sample rates.
+                scale = RATE if h.flags & 8 else 1
+                ports[d.PortNames[n].decode()] = (h.lower * scale if h.flags & 1 else None, h.upper * scale if h.flags & 2 else None)
     return found
 
 
@@ -200,16 +214,26 @@ if not lsp:
 else:
     has = control_inputs(lsp)
     for plugin, ports in sorted(known.items()):
-        there = has.get(plugin, set())
-        new = sorted(there - set(ports))
-        gone = sorted(p for p, why in ports.items() if p not in there and why == "set by the app")
-        unused = sorted(p for p, why in ports.items() if p not in there and why != "set by the app")
-        ok = bool(there) and not new and not gone
+        there = has.get(plugin, {})
+        new = sorted(set(there) - set(ports))
+        gone = sorted(p for p, sent in ports.items() if p not in there and isinstance(sent, dict))
+        unused = sorted(p for p, sent in ports.items() if p not in there and not isinstance(sent, dict))
+        beyond = []
+        for p, sent in sorted(ports.items()):
+            if p in there and isinstance(sent, dict):
+                low, high = there[p]
+                # The limits are 32-bit numbers, and so is what the app sends.
+                slack = 1e-4 * max(abs(sent["min"]), abs(sent["max"]))
+                if (low is not None and sent["min"] < low - slack) or (high is not None and sent["max"] > high + slack):
+                    beyond.append(f"“{p}”: the app sends {sent['min']:g} to {sent['max']:g}, and the plugin takes {'any' if low is None else f'{low:g}'} to {'any' if high is None else f'{high:g}'}")
+        ok = bool(there) and not new and not gone and not beyond
         print(f"  {'ok  ' if ok else 'FAIL'} {plugin}: {len(there)} controls" + ("" if there else ", so the plugin is missing"))
         for p in new:
             print(f"         “{p}” isn't known: the app neither sets it nor lists it in LEFT_AT_DEFAULT")
         for p in gone:
             print(f"         “{p}” is set by the app, and the plugin doesn't have it")
+        for line in beyond:
+            print(f"         {line}")
         if unused:
             print(f"         not in this plugin, which is fine: {', '.join(unused)}")
         if not ok:
@@ -242,6 +266,14 @@ with App(lambda s: s.update(bands=two)):
 print("Preamp and switches")
 with App(lambda s: s.update(bands=[band("Bell", 1000.0, 6.0, 1.0)], preamp=-6.0)):
     check("preamp -6 plus band +6 at 1 kHz", measure(1000) - LEVEL_DB, 0.0)
+# The plugin's input gain stops at +20 dB, and so does the slider. A saved +24 always
+# played as +20: now it also reads +20.
+with App(lambda s: s.update(bands=[], preamp=24.0)):
+    check("a saved preamp of +24 plays as +20", measure(1000, db=-40.0) + 40.0, 20.0)
+saved = json.load(open(os.path.join(cfg, "state.json")))["output"]["sound"]["preamp"]
+print(f"  {'ok  ' if saved == 20.0 else 'FAIL'} and it's saved as +20: {saved:+g}")
+if saved != 20.0:
+    fails.append("preamp saved within the plugin's range")
 with App(lambda s: s.update(bands=[band("Bell", 1000.0, 12.0, 1.0)], eq_enabled=False)):
     check("EQ switched off is flat", measure(1000) - LEVEL_DB, 0.0)
 b = band("Bell", 1000.0, 12.0, 1.0)
@@ -269,7 +301,9 @@ with App(lambda s: effect(s, "limiter", threshold=-12.0)):
 
 print("Compressor")
 with App(lambda s: effect(s, "compressor", threshold=-30.0, ratio=4.0, knee=-1.0, attack=1.0, makeup=0.0)):
-    check("-30 threshold, 4:1: a -6 dB tone comes out near -24", measure(1000, db=-6.0, seconds=1.5), -24.0, tol=2.5)
+    # The compressor reads the RMS level, which for a tone is 3 dB under its peak: 21 dB
+    # over the threshold, so 15.75 dB of reduction. Reading peaks, it would be 18 dB.
+    check("-30 threshold, 4:1: a -6 dB tone comes out near -21.75", measure(1000, db=-6.0, seconds=1.5), -21.75, tol=1.0)
     check("-30 threshold, 4:1: a -50 dB tone is untouched", measure(1000, db=-50.0), -50.0, tol=1.0)
 
 print("Loudness")

@@ -457,6 +457,9 @@ def sound_tests():
     with App(effect("gate", threshold=-30.0, reduction=-24.0, attack=1.0, release=50.0)):
         check("-30 threshold: a -10 dB tone passes", measure(1000, db=-10.0), -10.0, tol=1.0)
         check("-30 threshold: a -50 dB tone is lowered by 24 dB", measure(1000, db=-50.0, seconds=1.5), -74.0, tol=2.5)
+        # The gate closes fully within 6 dB under the threshold (its zone). Left to the
+        # plugin's hint the zone was 15 dB, and this tone came out about 8 dB too loud.
+        check("-30 threshold: so is a -36 dB tone, just under it", measure(1000, db=-36.0, seconds=1.5), -60.0, tol=2.5)
 
     print("Auto Gain")
     with App(effect("autogain", target=-20.0, maxgain=12.0)):
@@ -465,7 +468,9 @@ def sound_tests():
 
     print("Compressor")
     with App(effect("compressor", threshold=-30.0, ratio=4.0, knee=-1.0, attack=1.0, makeup=0.0)):
-        check("-30 threshold, 4:1: a -6 dB tone comes out near -24", measure(1000, db=-6.0, seconds=1.5), -24.0, tol=2.5)
+        # The compressor reads the RMS level, which for a tone is 3 dB under its peak: 21 dB
+        # over the threshold, so 15.75 dB of reduction. Reading peaks, it would be 18 dB.
+        check("-30 threshold, 4:1: a -6 dB tone comes out near -21.75", measure(1000, db=-6.0, seconds=1.5), -21.75, tol=1.0)
         check("-30 threshold, 4:1: a -50 dB tone is untouched", measure(1000, db=-50.0), -50.0, tol=1.0)
 
     print("Limiter")
@@ -535,6 +540,16 @@ def preset_tests():
             got = measure(1000, seconds=2.0)
             report(-30.0 <= got <= -10.0, f"{name}: a -20 dB tone comes out at {got:+.1f} dB")
         report(app.saved()["output"]["preset"] == "Flat", "the Output's preset is left alone")
+
+        print("Presets: a change to the sound makes it Custom, and Active doesn't")
+        # A preset saves which effects are on, so a switch changes what was loaded.
+        win.click("switch", "Equalizer curve")
+        saved = wait_for(lambda: app.saved()["mic"]["preset"] == "Custom", timeout=3)
+        report(bool(saved) and bool(win.find("toggle button", "Custom")), "the curve switched off: the preset reads Custom")
+        win.pick_preset("Custom", "Flat")
+        win.set_active(not win.active())
+        sleep(1.5)
+        report(app.saved()["mic"]["preset"] == "Flat" and bool(win.find("toggle button", "Flat")), "Active switched: the preset still reads Flat")
 
 
 def active_tests():
