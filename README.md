@@ -234,6 +234,33 @@ GNOME's remote-desktop interface, and it only runs in a GNOME session. It leaves
 chains off, so no sound is touched. For about two minutes the pointer and the keyboard
 are the test's.
 
+## Recording a bug report
+
+A bug that only shows on your hardware (a volume that drops, a device that doesn't
+come back, sound that's late) is easiest to fix when the report has what happened and
+when. `tests/record.py` records it. It only reads: it never starts or stops a chain,
+changes a volume or a device, or plays a sound, and its level meters are marked as
+meters, so they don't turn on the microphone icon or switch Bluetooth headphones to
+their headset profile.
+
+    python3 tests/record.py --launch equalizer
+
+It starts the app with `EQUALIZER_TRACE=1` (for the Flatpak:
+`--launch "flatpak run --env=EQUALIZER_TRACE=1 io.github.zoeruda.Equalizer"`) and
+keeps one timeline of PipeWire's changes (nodes, links, volumes, routes, the default
+devices), how loud the sound is going in and out, the delay each sink reports, what
+records from a microphone, media players' play and pause, and the app's own trace of
+what it decided and why. Press Enter whenever something looks or sounds wrong and say
+what. Ctrl-C ends it, and it writes `~/equalizer-record-report-<time>.json` with a
+`-summary.txt` beside it. Look through the summary before sending it: user and host
+names, media titles and Bluetooth addresses are left out, but device and app names
+stay in.
+
+`--steps FILE` walks you through a list of things to try (one `id | text` line each) and
+asks after each whether anything was off, and `--keep 10` holds only the last ten minutes
+and writes the report when you add a mark, for leaving it running all day. Without
+`--launch`, start the app yourself; the timeline then has no trace lines.
+
 ## Special recognition
 
 Equalizer wouldn't look or work the way it does without two projects:

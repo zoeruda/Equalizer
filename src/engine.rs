@@ -21,6 +21,30 @@ use std::time::{Duration, Instant};
 use crate::dsp::Analyzer;
 use crate::model::{Direction, SINK_NAME, SOURCE_NAME, effect};
 
+/// When tracing started, or `None` if `EQUALIZER_TRACE` isn't set to something but 0.
+fn trace_start() -> Option<Instant> {
+    static START: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
+    *START.get_or_init(|| std::env::var("EQUALIZER_TRACE").ok().filter(|v| !v.is_empty() && v != "0").map(|_| Instant::now()))
+}
+
+/// With `EQUALIZER_TRACE=1`, prints one line to stderr for a decision the engine made:
+/// `equalizer-trace: +SECONDS what`. Costs one cached check when off, and the
+/// arguments aren't evaluated.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if let Some(start) = trace_start() {
+            eprintln!("equalizer-trace: +{:.3} {}", start.elapsed().as_secs_f64(), format_args!($($arg)*));
+        }
+    };
+}
+
+/// A volume for the trace, in dB per channel.
+fn db_text(v: &Volume) -> String {
+    let db = |x: f32| if x > 1e-5 { format!("{:.1}", 20.0 * x.log10()) } else { "-inf".to_string() };
+    let ch: Vec<String> = v.channels.iter().map(|x| db(*x)).collect();
+    format!("[{}] dB{}", ch.join(" "), if v.mute { " muted" } else { "" })
+}
+
 const OUT_STREAM: &str = "equalizer_out";
 const MIC_STREAM: &str = "equalizer_mic_in";
 /// The graph controls that receive the virtual output's volume, one per channel.
@@ -239,17 +263,34 @@ fn pick_device(
     defaults: [Option<&str>; 2],
     device_of: &HashMap<String, u32>,
 ) -> Option<String> {
+    pick_device_rule(devices, wanted, previous, defaults, device_of).map(|(name, _)| name)
+}
+
+/// `pick_device`, and which rule chose the device (for the trace).
+fn pick_device_rule(
+    devices: &[(String, Option<u32>)],
+    wanted: Option<&str>,
+    previous: Option<&str>,
+    defaults: [Option<&str>; 2],
+    device_of: &HashMap<String, u32>,
+) -> Option<(String, &'static str)> {
     let exists = |n: &str| devices.iter().any(|(d, _)| d == n);
     let same_device = |n: &str| {
         let device = device_of.get(n)?;
         devices.iter().find(|(_, d)| d.as_ref() == Some(device)).map(|(name, _)| name.clone())
     };
-    [wanted, previous]
+    [(wanted, "the chosen device"), (previous, "the default from before Equalizer")]
         .into_iter()
-        .flatten()
-        .find_map(|n| if exists(n) { Some(n.to_string()) } else { same_device(n) })
-        .or(defaults.into_iter().flatten().find(|n| exists(n)).map(str::to_string))
-        .or(devices.first().map(|(n, _)| n.clone()))
+        .find_map(|(n, what)| {
+            let n = n?;
+            if exists(n) {
+                Some((n.to_string(), what))
+            } else {
+                same_device(n).map(|name| (name, "another output of the same device as the chosen or previous one"))
+            }
+        })
+        .or_else(|| defaults.into_iter().flatten().find(|n| exists(n)).map(|n| (n.to_string(), "the desktop's default")))
+        .or_else(|| devices.first().map(|(n, _)| (n.clone(), "the first device listed")))
 }
 
 struct LinkEnds {
@@ -555,6 +596,7 @@ unsafe extern "C" fn module_destroyed(data: *mut std::ffi::c_void) {
     // which stays allocated until `Inner::unload` frees it, after the module has gone.
     let watch = unsafe { &*data.cast::<ModuleWatch>() };
     watch.gone.set(true);
+    trace!("module: the {} chain's module is gone, expected: {}", own(watch.dir as usize), watch.expected.get());
     if !watch.expected.get() {
         let what = match watch.dir {
             Direction::Output => "device",
@@ -741,8 +783,13 @@ impl Inner {
 
     /// The real device a chain should use (see `pick_device`).
     fn resolve_hw(&self, dir: usize) -> Option<String> {
+        self.resolve_hw_rule(dir).map(|(name, _)| name)
+    }
+
+    /// `resolve_hw`, and the rule that chose the device.
+    fn resolve_hw_rule(&self, dir: usize) -> Option<(String, &'static str)> {
         let c = &self.chains[dir];
-        pick_device(
+        pick_device_rule(
             &self.candidates(dir),
             c.wanted.as_deref(),
             c.previous_default.as_deref(),
@@ -776,6 +823,7 @@ impl Inner {
     }
 
     fn set_default(&self, dir: usize, name: Option<&str>) {
+        trace!("default: setting the {} default to {name:?}", own(dir));
         if let Some(m) = &self.metadata {
             match name {
                 Some(n) => m.set_property(0, DEFAULT_KEYS[dir], Some("Spa:String:JSON"), Some(&default_device_json(n))),
@@ -810,13 +858,16 @@ impl Inner {
             return;
         };
         if is_echo(&self.sent, &v, now) {
+            trace!("volume: device reports {}, ignored as an echo of what was sent", db_text(&v));
             return;
         }
         let shown = v.for_channels(2);
         if self.sink_volume.as_ref().is_some_and(|s| s.close(&shown, SAME_DB)) {
+            trace!("volume: device reports {}, already what Equalizer's device has", db_text(&v));
             self.synced = true;
             return;
         }
+        trace!("volume: device reports {}, a change from outside: showing it", db_text(&v));
         self.show_volume(shown);
     }
 
@@ -828,9 +879,11 @@ impl Inner {
             .as_ref()
             .is_some_and(|(s, at)| s.close(&v, SAME_DB) && now.duration_since(*at) < ECHO_WAIT)
         {
+            trace!("volume: not showing {} again, just shown", db_text(&v));
             return;
         }
         if let Some(node) = &self.chains[0].control {
+            trace!("volume: showing {} on Equalizer's device", db_text(&v));
             send_param(&own_volume_props(&v), |pod| node.set_param(spa::param::ParamType::Props, 0, pod));
             self.shown = Some((v, now));
         }
@@ -838,23 +891,33 @@ impl Inner {
 
     /// Passes a change to Equalizer's output volume on to the real device.
     fn forward_volume(&mut self, v: Volume) {
+        trace!("volume: Equalizer's device reports {}", db_text(&v));
         if self.shown.as_ref().is_some_and(|(s, _)| s.close(&v, SAME_DB)) {
             self.shown = None;
         }
         self.sink_volume = Some(v.clone());
-        let Some(real) = &self.real else { return };
-        let Some(current) = real.volume.clone() else { return };
+        let Some(real) = &self.real else {
+            trace!("volume: no real device to pass it to");
+            return;
+        };
+        let Some(current) = real.volume.clone() else {
+            trace!("volume: the real device has no volume to compare with");
+            return;
+        };
         if v.close(&current.for_channels(v.channels.len()), SAME_DB) {
+            trace!("volume: same as the device's {}, nothing to pass on", db_text(&current));
             self.synced = true;
             return;
         }
         if !self.synced {
+            trace!("volume: not synced yet, showing the device's {} instead of passing this on", db_text(&current));
             // Equalizer's output has just appeared, at the volume it starts with. It
             // shows the real device's volume first, and only then passes changes on.
             self.show_volume(current.for_channels(2));
             return;
         }
         let out = v.for_channels(current.channels.len());
+        trace!("volume: passing {} on to the device (it had {})", db_text(&out), db_text(&current));
         match (&real.device, &real.route) {
             (Some(device), Some(route)) => send_param(&route_volume(route, &out), |pod| {
                 device.set_param(spa::param::ParamType::Route, 0, pod)
@@ -878,14 +941,16 @@ impl Inner {
         if !self.chains[dir].on() {
             return false;
         }
-        let Some(hw) = self.resolve_hw(dir) else { return false };
+        let Some((hw, rule)) = self.resolve_hw_rule(dir) else { return false };
         if self.chains[dir].hw.as_deref() == Some(&hw) {
             return false;
         }
+        trace!("device: {} should use {hw}: {rule}", own(dir));
         let stream = if dir == 0 { OUT_STREAM } else { MIC_STREAM };
         let serial = self.nodes.values().find(|n| n.name == hw).map(|n| n.serial.clone());
         if let (Some(id), Some(serial), Some(m)) = (self.node_id(stream), serial, &self.metadata) {
             m.set_property(id, "target.object", Some("Spa:Id"), Some(&serial));
+            trace!("device: {} moves from {:?} to {hw}", own(dir), self.chains[dir].hw);
             self.chains[dir].hw = Some(hw);
             return true;
         }
@@ -897,6 +962,7 @@ impl Inner {
         if !chain.on() {
             return;
         }
+        trace!("module: unloading {}'s chain", own(dir));
         chain.volume_listener = None;
         chain.control = None;
         chain.gain = [1.0; 2];
@@ -1369,6 +1435,7 @@ fn run(
                 Direction::Mic => {}
             }
             let passive = dir == Direction::Output;
+            trace!("meters: rebuilt for {:?}: {}", dir, wanted.iter().map(|w| format!("{} {}", w.3, w.0)).collect::<Vec<_>>().join(", "));
             for (target, monitor, analyzer, label) in wanted {
                 match make_meter(&core, &target, monitor, passive, label, analyzer) {
                     Ok(m) => s.meters.push(m),
@@ -1611,8 +1678,10 @@ fn run(
                                 for d in 0..2 {
                                     if key == EFFECTIVE_KEYS[d] {
                                         s.effective[d] = name_json(value);
+                                        trace!("default: the effective {} default is now {:?}", own(d), s.effective[d]);
                                     } else if key == DEFAULT_KEYS[d] {
                                         let name = name_json(value);
+                                        trace!("default: the {} default is now {name:?}", own(d));
                                         if name.as_deref() == Some(own(d)) {
                                             s.chains[d].claim_default = false;
                                         }
@@ -1624,6 +1693,7 @@ fn run(
                                             && name.as_deref() != Some(own(d))
                                         {
                                             s.chains[d].previous_default = None;
+                                            trace!("default: someone chose {name:?}, so the {} chain steps aside", own(d));
                                             let dir = if d == 0 { Direction::Output } else { Direction::Mic };
                                             let _ = events2.try_send(Event::TurnedOffExternally(dir));
                                         }
@@ -1782,7 +1852,8 @@ fn run(
                 }
                 s.chains[d].wanted = device;
                 s.chains[d].previous_default = configured;
-                let Some(hw) = s.resolve_hw(d) else {
+                let Some((hw, rule)) = s.resolve_hw_rule(d) else {
+                    trace!("device: no device for the {} chain to use", own(d));
                     let what = if d == 0 { "output" } else { "microphone" };
                     let _ = events.try_send(Event::Error(format!("No {what} device is connected")));
                     let _ = events.try_send(Event::TurnedOffExternally(dir));
@@ -1804,6 +1875,7 @@ fn run(
                     let _ = events.try_send(Event::TurnedOffExternally(dir));
                     return;
                 }
+                trace!("module: loaded the {} chain on {hw}: {rule}", own(d));
                 s.chains[d].module = module;
                 s.chains[d].watch = watch_module(module, dir, events.clone());
                 s.chains[d].hw = Some(hw);
