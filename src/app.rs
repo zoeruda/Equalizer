@@ -90,6 +90,8 @@ impl Rt {
 }
 
 type Listener = Rc<dyn Fn(Direction)>;
+/// A closure a menu row can call to rebuild itself, set after it is made.
+type SelfRef = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
 pub struct Ctx {
     pub state: RefCell<AppState>,
@@ -385,7 +387,9 @@ fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk:
             let time = g.current_event_time();
             let settings = scale2.settings();
             let (within, reach) = (settings.gtk_double_click_time() as u32, settings.gtk_double_click_distance() as f64);
-            let second = last.get().is_some_and(|(t, lx, ly)| time.wrapping_sub(t) <= within && (x - lx).abs() <= reach && (y - ly).abs() <= reach);
+            let second = last
+                .get()
+                .is_some_and(|(t, lx, ly)| time.wrapping_sub(t) <= within && (x - lx).abs() <= reach && (y - ly).abs() <= reach);
             if second {
                 last.set(None);
                 g.set_state(gtk::EventSequenceState::Claimed);
@@ -405,7 +409,9 @@ fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk:
     // value is closed here first, and the focus is put back where it went.
     let focus = gtk::EventControllerFocus::new();
     focus.connect_leave(move |c| {
-        let Some(value) = c.widget().and_downcast::<gtk::EditableLabel>() else { return };
+        let Some(value) = c.widget().and_downcast::<gtk::EditableLabel>() else {
+            return;
+        };
         // Taken right away: a press on another band's point moves the focus first and
         // selects that band next, and what's typed belongs to the band it was typed for.
         // The value may stay open, as when the focus only passes through on its way back
@@ -420,7 +426,9 @@ fn slider(spec: Slider, get: Rc<dyn Fn() -> f64>, set: Rc<dyn Fn(f64)>) -> (gtk:
                 return;
             }
             // When the window itself is left, the focus stays in the value, and GTK closes it.
-            let Some(target) = value.root().and_then(|r| r.focus()) else { return };
+            let Some(target) = value.root().and_then(|r| r.focus()) else {
+                return;
+            };
             if target.is_ancestor(&value) {
                 return;
             }
@@ -1047,7 +1055,7 @@ fn preset_button(ctx: &Rc<Ctx>, win: &adw::ApplicationWindow, toasts: &adw::Toas
 
     let rebuild: Rc<dyn Fn()> = {
         let (ctx, list, popover, toasts) = (ctx.clone(), list.clone(), popover.clone(), toasts.clone());
-        let this: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let this: SelfRef = Rc::new(RefCell::new(None));
         let this2 = this.clone();
         let f: Rc<dyn Fn()> = Rc::new(move || {
             while let Some(c) = list.first_child() {
@@ -1800,11 +1808,21 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
 
     // Messages from the audio thread.
     {
-        let (ctx2, lists, fill, toasts2, note) = (ctx.clone(), device_lists.clone(), fill_devices.clone(), toasts.clone(), mic_note.clone());
+        let (ctx2, lists, fill, toasts2, note) = (
+            ctx.clone(),
+            device_lists.clone(),
+            fill_devices.clone(),
+            toasts.clone(),
+            mic_note.clone(),
+        );
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
-                    Event::Devices { sinks, sources, headset_switch } => {
+                    Event::Devices {
+                        sinks,
+                        sources,
+                        headset_switch,
+                    } => {
                         *lists.borrow_mut() = [sinks, sources];
                         fill();
                         note.set_visible(headset_switch[Direction::Mic as usize]);

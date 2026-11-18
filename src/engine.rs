@@ -24,7 +24,12 @@ use crate::model::{Direction, SINK_NAME, SOURCE_NAME, effect};
 /// When tracing started, or `None` if `EQUALIZER_TRACE` isn't set to something but 0.
 fn trace_start() -> Option<Instant> {
     static START: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
-    *START.get_or_init(|| std::env::var("EQUALIZER_TRACE").ok().filter(|v| !v.is_empty() && v != "0").map(|_| Instant::now()))
+    *START.get_or_init(|| {
+        std::env::var("EQUALIZER_TRACE")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|_| Instant::now())
+    })
 }
 
 /// With `EQUALIZER_TRACE=1`, prints one line to stderr for a decision the engine made:
@@ -40,7 +45,13 @@ macro_rules! trace {
 
 /// A volume for the trace, in dB per channel.
 fn db_text(v: &Volume) -> String {
-    let db = |x: f32| if x > 1e-5 { format!("{:.1}", 20.0 * x.log10()) } else { "-inf".to_string() };
+    let db = |x: f32| {
+        if x > 1e-5 {
+            format!("{:.1}", 20.0 * x.log10())
+        } else {
+            "-inf".to_string()
+        }
+    };
     let ch: Vec<String> = v.channels.iter().map(|x| db(*x)).collect();
     format!("[{}] dB{}", ch.join(" "), if v.mute { " muted" } else { "" })
 }
@@ -253,7 +264,6 @@ struct NodeInfo {
     device: Option<u32>,
 }
 
-
 /// The real device a chain should use, from those there are now (in the order they're
 /// listed): the chosen one, or another one of the same device; otherwise the default
 /// from before Equalizer, or another one of its device; otherwise the current defaults;
@@ -280,7 +290,10 @@ fn pick_device_rule(
     let exists = |n: &str| devices.iter().any(|(d, _)| d == n);
     let same_device = |n: &str| {
         let device = device_of.get(n)?;
-        devices.iter().find(|(_, d)| d.as_ref() == Some(device)).map(|(name, _)| name.clone())
+        devices
+            .iter()
+            .find(|(_, d)| d.as_ref() == Some(device))
+            .map(|(name, _)| name.clone())
     };
     [(wanted, "the chosen device"), (previous, "the default from before Equalizer")]
         .into_iter()
@@ -292,7 +305,13 @@ fn pick_device_rule(
                 same_device(n).map(|name| (name, "another output of the same device as the chosen or previous one"))
             }
         })
-        .or_else(|| defaults.into_iter().flatten().find(|n| exists(n)).map(|n| (n.to_string(), "the desktop's default")))
+        .or_else(|| {
+            defaults
+                .into_iter()
+                .flatten()
+                .find(|n| exists(n))
+                .map(|n| (n.to_string(), "the desktop's default"))
+        })
         .or_else(|| devices.first().map(|(n, _)| (n.clone(), "the first device listed")))
 }
 
@@ -481,7 +500,8 @@ fn own_volume_props(v: &Volume) -> Value {
         unreachable!("volume_props makes an object")
     };
     let soft = v.channels.iter().map(|&c| if v.mute || c == 0.0 { 0.0 } else { 1.0 }).collect();
-    obj.properties.push(prop(spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(soft))));
+    obj.properties
+        .push(prop(spa_sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(soft))));
     obj.properties.push(prop(spa_sys::SPA_PROP_softMute, Value::Bool(v.mute)));
     Value::Object(obj)
 }
@@ -498,10 +518,8 @@ struct Sent {
 /// one of them coming back, perhaps rounded to the device's steps, or the volume it had
 /// before, reported once more just after.
 fn is_echo(sent: &VecDeque<Sent>, v: &Volume, now: Instant) -> bool {
-    sent.iter().any(|s| {
-        s.volume.close(v, ECHO_DB)
-            || (now.duration_since(s.at) < STALE_WAIT && s.before.close(v, ECHO_DB))
-    })
+    sent.iter()
+        .any(|s| s.volume.close(v, ECHO_DB) || (now.duration_since(s.at) < STALE_WAIT && s.before.close(v, ECHO_DB)))
 }
 
 struct Route {
@@ -599,7 +617,11 @@ unsafe extern "C" fn module_destroyed(data: *mut std::ffi::c_void) {
     // which stays allocated until `Inner::unload` frees it, after the module has gone.
     let watch = unsafe { &*data.cast::<ModuleWatch>() };
     watch.gone.set(true);
-    trace!("module: the {} chain's module is gone, expected: {}", own(watch.dir as usize), watch.expected.get());
+    trace!(
+        "module: the {} chain's module is gone, expected: {}",
+        own(watch.dir as usize),
+        watch.expected.get()
+    );
     if !watch.expected.get() {
         let what = match watch.dir {
             Direction::Output => "device",
@@ -811,9 +833,8 @@ impl Inner {
     /// Whether each direction uses, or would use when turned on, a stand-in microphone.
     fn headset_switch(&self) -> [bool; 2] {
         [0, 1].map(|d| {
-            self.device_in_use(d).is_some_and(|name| {
-                self.nodes.iter().any(|(id, n)| n.name == name && self.stand_ins.contains(id))
-            })
+            self.device_in_use(d)
+                .is_some_and(|name| self.nodes.iter().any(|(id, n)| n.name == name && self.stand_ins.contains(id)))
         })
     }
 
@@ -893,7 +914,9 @@ impl Inner {
         if !self.chains[dir].on() {
             return false;
         }
-        let Some((hw, rule)) = self.resolve_hw_rule(dir) else { return false };
+        let Some((hw, rule)) = self.resolve_hw_rule(dir) else {
+            return false;
+        };
         if self.chains[dir].hw.as_deref() == Some(&hw) {
             return false;
         }
@@ -962,6 +985,12 @@ impl Inner {
         };
         let streams = streams_to_move(&self.links, &self.nodes, device);
         for id in &streams {
+            trace!(
+                "streams: pinning stream {id} ({}) to {}, which the app thinks {} dont-fallback",
+                self.nodes.get(id).map_or("?", |n| n.name.as_str()),
+                destination.unwrap_or("?"),
+                if self.nodes.get(id).is_some_and(|n| n.dont_fallback) { "has" } else { "doesn't have" }
+            );
             metadata.set_property(*id, "target.object", Some("Spa:Id"), Some(serial));
         }
         self.chains[dir].pinned = streams;
@@ -1380,7 +1409,11 @@ fn run(
                 Direction::Mic => {}
             }
             let passive = dir == Direction::Output;
-            trace!("meters: rebuilt for {:?}: {}", dir, wanted.iter().map(|w| format!("{} {}", w.3, w.0)).collect::<Vec<_>>().join(", "));
+            trace!(
+                "meters: rebuilt for {:?}: {}",
+                dir,
+                wanted.iter().map(|w| format!("{} {}", w.3, w.0)).collect::<Vec<_>>().join(", ")
+            );
             for (target, monitor, analyzer, label) in wanted {
                 match make_meter(&core, &target, monitor, passive, label, analyzer) {
                     Ok(m) => s.meters.push(m),
@@ -1534,7 +1567,11 @@ fn run(
                                             let stand_in = matches!(props.get("bluez5.loopback"), Some("true" | "1"));
                                             let Some(inner) = weak.upgrade() else { return };
                                             let Ok(mut s) = inner.try_borrow_mut() else { return };
-                                            let changed = if stand_in { s.stand_ins.insert(id) } else { s.stand_ins.remove(&id) };
+                                            let changed = if stand_in {
+                                                s.stand_ins.insert(id)
+                                            } else {
+                                                s.stand_ins.remove(&id)
+                                            };
                                             drop(s);
                                             if changed {
                                                 send();
@@ -2035,10 +2072,19 @@ mod tests {
         assert_eq!(props_volumes(&v).0, Some(vol(&[0.27, 0.27], false)));
         assert_eq!(soft_volumes(&v), (Some(vec![1.0, 1.0]), Some(false)));
         // As filter-chain sets them itself: muted, or at zero, is silent.
-        assert_eq!(soft_volumes(&own_volume_props(&vol(&[0.27, 0.27], true))), (Some(vec![0.0, 0.0]), Some(true)));
-        assert_eq!(soft_volumes(&own_volume_props(&vol(&[0.0, 0.5], false))), (Some(vec![0.0, 1.0]), Some(false)));
+        assert_eq!(
+            soft_volumes(&own_volume_props(&vol(&[0.27, 0.27], true))),
+            (Some(vec![0.0, 0.0]), Some(true))
+        );
+        assert_eq!(
+            soft_volumes(&own_volume_props(&vol(&[0.0, 0.5], false))),
+            (Some(vec![0.0, 1.0]), Some(false))
+        );
         // The real device's volume is applied however its node does it, so it has none.
-        assert_eq!(soft_volumes(&volume_props(&vol(&[0.27, 0.27], false), spa::param::ParamType::Props)), (None, None));
+        assert_eq!(
+            soft_volumes(&volume_props(&vol(&[0.27, 0.27], false), spa::param::ParamType::Props)),
+            (None, None)
+        );
     }
 
     #[test]
@@ -2213,9 +2259,16 @@ mod tests {
         // The default from before Equalizer...
         assert_eq!(pick(None, Some("bluez_output.a2dp")).as_deref(), Some("bluez_output.hfp"));
         // ...or the chosen device, which comes before another default that's still there.
-        assert_eq!(pick(Some("bluez_output.a2dp"), Some("builtin")).as_deref(), Some("bluez_output.hfp"));
+        assert_eq!(
+            pick(Some("bluez_output.a2dp"), Some("builtin")).as_deref(),
+            Some("bluez_output.hfp")
+        );
         // Back in A2DP, its own output again.
-        let back = listed(&[("bluez_output.a2dp", Some(74)), ("bluez_output.hfp", Some(74)), ("builtin", Some(1))]);
+        let back = listed(&[
+            ("bluez_output.a2dp", Some(74)),
+            ("bluez_output.hfp", Some(74)),
+            ("builtin", Some(1)),
+        ]);
         assert_eq!(
             pick_device(&back, Some("bluez_output.a2dp"), None, [None, None], &device_of).as_deref(),
             Some("bluez_output.a2dp")

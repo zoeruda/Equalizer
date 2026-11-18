@@ -652,7 +652,8 @@ finally:
     if w.noted:
         print(f"noted, not a failure: {len(w.noted)} lines like “{w.noted[0]}”")
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = os.path.expanduser(f"~/equalizer-events-report-{stamp}.json")
+    # In the home folder, unless EQUALIZER_REPORT_DIR says otherwise (tests/all.py sets it).
+    path = os.path.join(os.path.expanduser(os.environ.get("EQUALIZER_REPORT_DIR") or "~"), f"equalizer-events-report-{stamp}.json")
     try:
         json.dump(report, open(path, "w"), indent=1)
         print(f"report: {path}")

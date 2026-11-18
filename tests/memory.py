@@ -61,6 +61,7 @@ from gi.repository import Atspi, GLib
 APP_ID = "io.github.zoeruda.Equalizer"
 RATE = 48000
 SILENT = "eqmem_out"  # the Output's speakers
+GUARD = "eqmem_guard"  # the default speakers while the test runs, so that no stream can reach real ones
 EXTRA = "eqmem_extra"  # the device the devices scenario adds and removes
 FAKE_IN = "eqmem_in"  # what the test plays into, to reach the fake microphone
 FAKE_MIC = "eqmem_mic"  # the microphone the app records
@@ -724,8 +725,10 @@ def active(app, o):
 
         # With the Output off, the app hands the default speakers back and waits for the
         # streams that follow the default to leave its virtual speakers. The test's
-        # player never moves, so it can't reach your speakers: the app waits until its
-        # time limit and removes them with the player attached. That says so in its log.
+        # player asks not to move (node.dont-fallback), but the app doesn't see that, so it
+        # does move it to the default: the silent guard device (see GUARD), which is why
+        # the test sets one. (Until 2026-11-18 this comment said the player couldn't reach
+        # the speakers: it did, and played noise through them.)
         def step(i):
             win.set_active(False)
             if not wait_for(lambda: not node_exists(device), timeout=6):
@@ -900,11 +903,23 @@ def main():
         stderr=subprocess.DEVNULL,
     )
     app = None
+    guard = None
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    saved_to = os.path.expanduser(f"~/equalizer-memory-report-{stamp}.json")
+    # In the home folder, unless EQUALIZER_REPORT_DIR says otherwise (tests/all.py sets it).
+    saved_to = os.path.join(os.path.expanduser(os.environ.get("EQUALIZER_REPORT_DIR") or "~"), f"equalizer-memory-report-{stamp}.json")
     try:
         if not wait_for(lambda: node_exists(FAKE_MIC) and node_exists(FAKE_IN) and node_exists(SILENT), timeout=5):
             sys.exit("couldn't create the fake microphone and the silent device")
+        # The test's players are pinned to its own devices, but the app moves other streams
+        # to the default when Active goes off, and it has moved these too (the app doesn't
+        # see a stream's node.dont-fallback). A silent default means that nothing the test
+        # plays can reach your speakers, whatever the app does. Put back below.
+        guard = run("pactl", "load-module", "module-null-sink", f"sink_name={GUARD}", "sink_properties=device.description=EqMemGuard")
+        if not wait_for(lambda: node_exists(GUARD), timeout=5):
+            sys.exit("couldn't create the silent default device, so nothing was played")
+        run("pactl", "set-default-sink", GUARD)
+        if run("pactl", "get-default-sink") != GUARD:
+            sys.exit("couldn't make the silent device the default, so nothing was played")
         track = os.path.join(tmp, "music.wav")
         print("Making the test signal...", flush=True)
         music(track)
@@ -947,6 +962,8 @@ def main():
                 else:
                     run("pw-metadata", "-n", "default", "-d", "0", key)
                 print(f"  note: the test put {key} back")
+        if guard:
+            run("pactl", "unload-module", guard)
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             from common import bad_app_lines

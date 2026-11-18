@@ -244,6 +244,21 @@ GNOME's remote-desktop interface, and it only runs in a GNOME session. It leaves
 chains off, so no sound is touched. For about two minutes the pointer and the keyboard
 are the test's.
 
+`tests/all.py` runs all of the above before a release, and more: `cargo fmt --check`,
+`cargo clippy` with no warnings allowed, `shellcheck install.sh`, a release build, and a
+check that every file with the version number agrees. It stops at nothing, prints one
+table at the end, and saves a report in your home folder (`--out DIR` puts it elsewhere).
+
+    DISPLAY=:0 python3 tests/all.py
+
+It asks before it takes the screen and the pointer, about 15 to 20 minutes with the
+window uncovered, and asks you to quit Equalizer first. `--long` adds the hour-long
+memory run and a longer events run, `--binary PATH` tests a build made elsewhere, and
+`--only` and `--skip` pick stages (`tests/all.py --help` lists them). The apps run with
+`MALLOC_PERTURB_` set, so that using freed memory shows, on top of glibc's own checks.
+`--flatpak` builds the Flatpak and runs `tests/measure.py` against it; it hasn't been
+tried yet.
+
 ## Recording a bug report
 
 A bug that only shows on your hardware (a volume that drops, a device that doesn't

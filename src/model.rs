@@ -123,6 +123,7 @@ pub struct EffectSpec {
     pub fixed: &'static [(&'static str, f32)],
 }
 
+#[allow(clippy::too_many_arguments)] // builds a table of constants: one argument per field
 const fn p(
     id: &'static str,
     label: &'static str,

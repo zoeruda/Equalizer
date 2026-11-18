@@ -85,6 +85,7 @@ pub fn grid(cr: &Context, w: f64, h: f64, cols: usize, rows: usize, color: Rgb) 
     let _ = cr.stroke();
 }
 
+#[allow(clippy::too_many_arguments)] // a drawing helper: every argument is a separate thing to draw
 pub fn text(cr: &Context, s: &str, x: f64, y: f64, size: f64, color: Rgb, alpha: f64, align: pango::Alignment) -> (f64, f64) {
     let layout = pangocairo::functions::create_layout(cr);
     let mut desc = pango::FontDescription::new();
@@ -185,6 +186,7 @@ pub fn runs(data: &VecDeque<f64>) -> Vec<std::ops::Range<usize>> {
 /// A scrolling level trace, newest on the right, in dBFS. `blur_px` is set in pixels, so
 /// a graph keeps its look when the window is resized. NaN marks a time when nothing was
 /// measured, which is left empty.
+#[allow(clippy::too_many_arguments)] // a drawing helper: every argument is a separate thing to draw
 pub fn trace(cr: &Context, w: f64, h: f64, data: &VecDeque<f64>, capacity: usize, color: Rgb, fill: bool, line_alpha: f64, blur_px: f64) {
     if data.len() < 2 {
         return;
