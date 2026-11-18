@@ -1722,3 +1722,235 @@ mod tests {
         }
     }
 }
+
+/// Random and damaged input to everything that reads settings: saved state, presets
+/// and imported files.
+#[cfg(test)]
+mod random_input {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// `n` cases, or what `PROPTEST_CASES` says for a longer run.
+    fn cases(n: u32) -> ProptestConfig {
+        ProptestConfig::with_cases(std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(n))
+    }
+
+    /// Numbers of every kind, as a damaged file can have them.
+    fn weird_f64() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            4 => -1000.0f64..1000.0,
+            2 => proptest::num::f64::ANY,
+            1 => Just(f64::NAN),
+            1 => Just(f64::INFINITY),
+            1 => Just(f64::NEG_INFINITY),
+            1 => Just(1e300),
+            1 => Just(-0.0),
+        ]
+    }
+
+    fn arb_kind() -> impl Strategy<Value = FilterKind> {
+        prop_oneof![
+            Just(FilterKind::Bell),
+            Just(FilterKind::LowShelf),
+            Just(FilterKind::HighShelf),
+            Just(FilterKind::LowPass),
+            Just(FilterKind::HighPass),
+            Just(FilterKind::Notch),
+        ]
+    }
+
+    fn arb_band() -> impl Strategy<Value = Band> {
+        (arb_kind(), weird_f64(), weird_f64(), weird_f64(), any::<bool>()).prop_map(|(kind, freq, gain, q, enabled)| Band {
+            kind,
+            freq,
+            gain,
+            q,
+            enabled,
+        })
+    }
+
+    /// Any sound a file could hold: out-of-range and non-finite values, too many bands,
+    /// missing effects and parameters, and ones the app doesn't know.
+    fn arb_sound() -> impl Strategy<Value = Sound> {
+        let values = proptest::collection::vec(weird_f64(), 64);
+        (
+            proptest::collection::vec(arb_band(), 0..60),
+            weird_f64(),
+            weird_f64(),
+            any::<bool>(),
+            values,
+            proptest::collection::vec(0u8..8, 64),
+        )
+            .prop_map(|(bands, preamp, balance, eq_enabled, values, fate)| {
+                let mut sound = Sound::flat();
+                sound.bands = bands;
+                sound.preamp = preamp;
+                sound.balance = balance;
+                sound.eq_enabled = eq_enabled;
+                let mut i = 0;
+                for spec in EFFECTS {
+                    for param in spec.params {
+                        let state = sound.effects.get_mut(spec.id).unwrap();
+                        match fate[i % 64] {
+                            0 => {
+                                state.params.remove(param.id);
+                            }
+                            1 => {} // as it is
+                            _ => {
+                                state.params.insert(param.id.to_string(), values[i % 64]);
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                sound.effects.insert(
+                    "not an effect".into(),
+                    EffectState {
+                        enabled: true,
+                        params: BTreeMap::new(),
+                    },
+                );
+                sound
+            })
+    }
+
+    /// Whether two JSON values are the same, numbers to within a part in 10^12.
+    fn same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+        use serde_json::Value::*;
+        match (a, b) {
+            (Number(x), Number(y)) => {
+                let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                (x - y).abs() <= 1e-12 * x.abs().max(y.abs())
+            }
+            (Array(x), Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
+            (Object(x), Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w))),
+            _ => a == b,
+        }
+    }
+
+    fn assert_in_range(s: &Sound) -> Result<(), TestCaseError> {
+        prop_assert!(s.bands.len() <= MAX_BANDS);
+        for b in &s.bands {
+            prop_assert!((10.0..=24_000.0).contains(&b.freq), "{b:?}");
+            prop_assert!((-GAIN_LIMIT..=GAIN_LIMIT).contains(&b.gain), "{b:?}");
+            prop_assert!((0.1..=20.0).contains(&b.q), "{b:?}");
+        }
+        prop_assert!((-GAIN_LIMIT..=PREAMP_MAX).contains(&s.preamp), "{}", s.preamp);
+        prop_assert!((-100.0..=100.0).contains(&s.balance), "{}", s.balance);
+        for spec in EFFECTS {
+            for param in spec.params {
+                if let Some(v) = s.effects.get(spec.id).and_then(|e| e.params.get(param.id)) {
+                    prop_assert!((param.min..=param.max).contains(v), "{} {} = {v}", spec.id, param.id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(cases(300))]
+
+        #[test]
+        fn cleaning_brings_anything_into_range_and_twice_is_the_same_as_once(mut s in arb_sound()) {
+            s.sanitize();
+            assert_in_range(&s)?;
+            let once = s.clone();
+            s.sanitize();
+            prop_assert_eq!(s, once);
+        }
+
+        #[test]
+        fn a_clean_sound_is_read_back_unchanged(mut s in arb_sound()) {
+            s.sanitize();
+            // As the state file and the preset files are written and read.
+            let back: Sound = serde_json::from_slice(&serde_json::to_vec_pretty(&s).unwrap()).unwrap();
+            // Not exactly: serde_json's default number reading can be one step off in the
+            // last digit (its `float_roundtrip` feature would fix that; a find of Part 4
+            // of the 0.0.8 plan, with no audible effect).
+            prop_assert!(same(&serde_json::to_value(&back).unwrap(), &serde_json::to_value(&s).unwrap()), "{back:?} {s:?}");
+        }
+
+        #[test]
+        fn a_damaged_file_is_refused_or_cleaned_and_never_panics(
+            s in arb_sound(),
+            cuts in proptest::collection::vec((0usize..4000, 0usize..8, "[0-9eE+.\\-\"{}\\[\\],:a-z ]{0,6}"), 1..4),
+        ) {
+            let mut text = serde_json::to_string(&s).unwrap_or_default();
+            for (at, len, with) in cuts {
+                if text.is_empty() {
+                    break;
+                }
+                let start = (0..=at.min(text.len())).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+                let end = (start + len..=text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
+                text.replace_range(start..end, &with);
+            }
+            if let Ok(mut sound) = serde_json::from_str::<Sound>(&text) {
+                sound.sanitize();
+                assert_in_range(&sound)?;
+            }
+            if let Ok(mut state) = serde_json::from_str::<AppState>(&text) {
+                state.output.sound.sanitize();
+                state.mic.sound.sanitize();
+                assert_in_range(&state.output.sound)?;
+                assert_in_range(&state.mic.sound)?;
+            }
+        }
+    }
+
+    /// Words of an APO file, mixed up: a line can start anywhere and stop anywhere.
+    fn apo_text() -> impl Strategy<Value = String> {
+        let word = prop_oneof![
+            3 => Just("Filter".to_string()),
+            3 => Just("Preamp:".to_string()),
+            3 => (1u32..40).prop_map(|n| format!("{n}:")),
+            2 => prop_oneof![Just("ON"), Just("OFF")].prop_map(String::from),
+            3 => prop_oneof![
+                Just("PK"), Just("LSC"), Just("HSC"), Just("LS"), Just("HS"), Just("LP"), Just("HP"),
+                Just("NO"), Just("PEQ"), Just("Modal"), Just("LPQ"), Just("HPQ"), Just("XX")
+            ].prop_map(String::from),
+            3 => prop_oneof![Just("Fc"), Just("Gain"), Just("Q"), Just("Hz"), Just("dB")].prop_map(String::from),
+            4 => prop_oneof![
+                Just("100"), Just("-3.5"), Just("NaN"), Just("inf"), Just("-inf"), Just("1e999"), Just("99999"),
+                Just("-500"), Just("0"), Just("1e-999"), Just("."), Just("-")
+            ].prop_map(String::from),
+            1 => "[ -~]{0,8}",
+        ];
+        proptest::collection::vec(proptest::collection::vec(word, 0..14).prop_map(|w| w.join(" ")), 0..45).prop_map(|l| l.join("\n"))
+    }
+
+    proptest! {
+        #![proptest_config(cases(1000))]
+
+        #[test]
+        fn an_imported_file_never_panics_and_comes_out_in_range(text in apo_text()) {
+            if let Ok(sound) = parse_apo(&text) {
+                prop_assert!(!sound.bands.is_empty());
+                assert_in_range(&sound)?;
+                let mut again = sound.clone();
+                again.sanitize();
+                prop_assert_eq!(again, sound);
+            }
+        }
+
+        #[test]
+        fn any_text_at_all_can_be_imported_without_a_panic(text in "\\PC{0,300}") {
+            let _ = parse_apo(&text);
+        }
+
+        #[test]
+        fn a_preset_name_never_leads_outside_its_folder(name in "\\PC{0,24}", parts in proptest::collection::vec(prop_oneof![Just(".."), Just("."), Just("/"), Just("\\"), Just("\0"), Just(" "), Just("a")], 0..6)) {
+            let folder = Path::new("/home/user/.config/equalizer/presets");
+            for name in [name, parts.concat()] {
+                if let Some(path) = preset_path_in(folder, &name) {
+                    prop_assert_eq!(path.parent(), Some(folder));
+                    let file = path.file_name().unwrap().to_str().unwrap();
+                    prop_assert!(!file.starts_with('.'), "{file}");
+                    prop_assert!(!file.contains(['/', '\\', '\0']), "{file}");
+                    prop_assert!(file.ends_with(".json"));
+                    // Saved under this name, it's listed under the same one.
+                    prop_assert!(name_is_usable(file.trim_end_matches(".json")));
+                }
+            }
+        }
+    }
+}

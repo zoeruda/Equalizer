@@ -45,6 +45,9 @@ fn db_text(v: &Volume) -> String {
     format!("[{}] dB{}", ch.join(" "), if v.mute { " muted" } else { "" })
 }
 
+mod volume;
+use volume::{Action, RealDevice, VolumeSync};
+
 const OUT_STREAM: &str = "equalizer_out";
 const MIC_STREAM: &str = "equalizer_mic_in";
 /// The graph controls that receive the virtual output's volume, one per channel.
@@ -714,16 +717,8 @@ struct Inner {
     registry: pw::registry::RegistryRc,
     post: Arc<Mutex<Analyzer>>,
     real: Option<RealOutput>,
-    /// Equalizer's own output volume, as last reported.
-    sink_volume: Option<Volume>,
-    /// Whether Equalizer's output has shown the real device's volume yet. Until then,
-    /// its own volume is only the one it started with.
-    synced: bool,
-    /// Volumes recently sent to the real device, to recognize them coming back.
-    sent: VecDeque<Sent>,
-    /// The volume last set on Equalizer's output, until it shows there. Setting the
-    /// same one again before then would do nothing useful.
-    shown: Option<(Volume, Instant)>,
+    /// Keeps Equalizer's output volume and the real device's the same.
+    sync: VolumeSync,
 }
 
 const DEFAULT_KEYS: [&str; 2] = ["default.configured.audio.sink", "default.configured.audio.source"];
@@ -852,83 +847,40 @@ impl Inner {
 
     /// Shows a change to the real device's volume, made anywhere, on Equalizer's output.
     fn follow_real(&mut self) {
-        let now = Instant::now();
-        self.sent.retain(|s| now.duration_since(s.at) < ECHO_WAIT);
-        let Some(v) = self.real.as_ref().and_then(|r| r.volume.clone()) else {
-            return;
-        };
-        if is_echo(&self.sent, &v, now) {
-            trace!("volume: device reports {}, ignored as an echo of what was sent", db_text(&v));
-            return;
-        }
-        let shown = v.for_channels(2);
-        if self.sink_volume.as_ref().is_some_and(|s| s.close(&shown, SAME_DB)) {
-            trace!("volume: device reports {}, already what Equalizer's device has", db_text(&v));
-            self.synced = true;
-            return;
-        }
-        trace!("volume: device reports {}, a change from outside: showing it", db_text(&v));
-        self.show_volume(shown);
-    }
-
-    /// Sets Equalizer's output volume, to show the real device's.
-    fn show_volume(&mut self, v: Volume) {
-        let now = Instant::now();
-        if self
-            .shown
-            .as_ref()
-            .is_some_and(|(s, at)| s.close(&v, SAME_DB) && now.duration_since(*at) < ECHO_WAIT)
-        {
-            trace!("volume: not showing {} again, just shown", db_text(&v));
-            return;
-        }
-        if let Some(node) = &self.chains[0].control {
-            trace!("volume: showing {} on Equalizer's device", db_text(&v));
-            send_param(&own_volume_props(&v), |pod| node.set_param(spa::param::ParamType::Props, 0, pod));
-            self.shown = Some((v, now));
-        }
+        let volume = self.real.as_ref().and_then(|r| r.volume.as_ref());
+        let action = self.sync.device_reported(volume, self.chains[0].control.is_some(), Instant::now());
+        self.act(action);
     }
 
     /// Passes a change to Equalizer's output volume on to the real device.
     fn forward_volume(&mut self, v: Volume) {
-        trace!("volume: Equalizer's device reports {}", db_text(&v));
-        if self.shown.as_ref().is_some_and(|(s, _)| s.close(&v, SAME_DB)) {
-            self.shown = None;
-        }
-        self.sink_volume = Some(v.clone());
-        let Some(real) = &self.real else {
-            trace!("volume: no real device to pass it to");
-            return;
+        let device = match &self.real {
+            None => RealDevice::Absent,
+            Some(r) => r.volume.as_ref().map_or(RealDevice::NoVolume, RealDevice::Volume),
         };
-        let Some(current) = real.volume.clone() else {
-            trace!("volume: the real device has no volume to compare with");
-            return;
-        };
-        if v.close(&current.for_channels(v.channels.len()), SAME_DB) {
-            trace!("volume: same as the device's {}, nothing to pass on", db_text(&current));
-            self.synced = true;
-            return;
+        let action = self.sync.sink_reported(v, device, self.chains[0].control.is_some(), Instant::now());
+        self.act(action);
+    }
+
+    /// Does what `VolumeSync` asked for.
+    fn act(&self, action: Option<Action>) {
+        match action {
+            None => {}
+            Some(Action::ShowOnSink(v)) => {
+                if let Some(node) = &self.chains[0].control {
+                    send_param(&own_volume_props(&v), |pod| node.set_param(spa::param::ParamType::Props, 0, pod));
+                }
+            }
+            Some(Action::SetDevice(out)) => {
+                let Some(real) = &self.real else { return };
+                match (&real.device, &real.route) {
+                    (Some(device), Some(route)) => send_param(&route_volume(route, &out), |pod| {
+                        device.set_param(spa::param::ParamType::Route, 0, pod)
+                    }),
+                    _ => set_volume(&real.node, &out),
+                }
+            }
         }
-        if !self.synced {
-            trace!("volume: not synced yet, showing the device's {} instead of passing this on", db_text(&current));
-            // Equalizer's output has just appeared, at the volume it starts with. It
-            // shows the real device's volume first, and only then passes changes on.
-            self.show_volume(current.for_channels(2));
-            return;
-        }
-        let out = v.for_channels(current.channels.len());
-        trace!("volume: passing {} on to the device (it had {})", db_text(&out), db_text(&current));
-        match (&real.device, &real.route) {
-            (Some(device), Some(route)) => send_param(&route_volume(route, &out), |pod| {
-                device.set_param(spa::param::ParamType::Route, 0, pod)
-            }),
-            _ => set_volume(&real.node, &out),
-        }
-        self.sent.push_back(Sent {
-            volume: out,
-            before: current,
-            at: Instant::now(),
-        });
     }
 
     fn node_id(&self, name: &str) -> Option<u32> {
@@ -967,9 +919,7 @@ impl Inner {
         chain.control = None;
         chain.gain = [1.0; 2];
         if dir == 0 {
-            self.sink_volume = None;
-            self.synced = false;
-            self.shown = None;
+            self.sync.sink_gone();
         }
         chain.pending.clear();
         chain.claim_default = false;
@@ -1109,10 +1059,8 @@ fn track_real_output(inner: &Rc<RefCell<Inner>>) {
         return;
     }
     s.real = None;
-    s.sent.clear();
-    s.shown = None;
     // A different device: Equalizer's output shows its volume before passing changes on.
-    s.synced = false;
+    s.sync.device_changed();
     s.update_post_gain();
     let Some(name) = want else { return };
     let Some(id) = s.node_id(&name) else { return };
@@ -1380,10 +1328,7 @@ fn run(
         registry: registry.clone(),
         post: post.clone(),
         real: None,
-        sink_volume: None,
-        synced: false,
-        sent: VecDeque::new(),
-        shown: None,
+        sync: VolumeSync::default(),
     }));
 
     // Rebuilds the meter streams to match the current state.
@@ -2320,5 +2265,123 @@ mod tests {
             (16, link(1, 99)), // A node that's already gone.
         ]);
         assert_eq!(streams_to_move(&links, &nodes, 1), vec![2, 3]);
+    }
+}
+
+/// `pick_device` for any list of devices and any wishes.
+#[cfg(test)]
+mod pick_device_random {
+    use super::*;
+    use proptest::prelude::*;
+
+    const OWN: &str = "equalizer_sink";
+
+    fn name() -> impl Strategy<Value = String> {
+        prop_oneof![Just("a"), Just("b"), Just("c"), Just("d"), Just("e"), Just("gone")].prop_map(String::from)
+    }
+
+    /// The devices there are now: never Equalizer's own (the caller leaves it out), and
+    /// each with the sound card it belongs to, if it has one.
+    fn devices() -> impl Strategy<Value = Vec<(String, Option<u32>)>> {
+        proptest::collection::vec((name(), proptest::option::of(0u32..3)), 0..6).prop_map(|mut v| {
+            let mut seen = HashSet::new();
+            v.retain(|(n, _)| seen.insert(n.clone()));
+            v
+        })
+    }
+
+    /// A wish: a device that's there, one that isn't, Equalizer's own, or nothing.
+    fn wish() -> impl Strategy<Value = Option<String>> {
+        prop_oneof![
+            3 => proptest::option::of(name()),
+            1 => Just(Some(OWN.to_string())),
+        ]
+    }
+
+    fn device_of() -> impl Strategy<Value = HashMap<String, u32>> {
+        proptest::collection::hash_map(name(), 0u32..3, 0..6)
+    }
+
+    fn pick(
+        devices: &[(String, Option<u32>)],
+        wanted: &Option<String>,
+        previous: &Option<String>,
+        defaults: &[Option<String>; 2],
+        card: &HashMap<String, u32>,
+    ) -> Option<String> {
+        pick_device(
+            devices,
+            wanted.as_deref(),
+            previous.as_deref(),
+            [defaults[0].as_deref(), defaults[1].as_deref()],
+            card,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(2000)
+        ))]
+
+        #[test]
+        fn it_picks_one_of_the_devices_there_are_and_never_equalizers_own(
+            devices in devices(), wanted in wish(), previous in wish(), d0 in wish(), d1 in wish(), card in device_of(),
+        ) {
+            let defaults = [d0, d1];
+            let picked = pick(&devices, &wanted, &previous, &defaults, &card);
+            // Something whenever there's something to pick, and nothing otherwise.
+            prop_assert_eq!(picked.is_some(), !devices.is_empty());
+            if let Some(p) = &picked {
+                prop_assert!(devices.iter().any(|(n, _)| n == p), "{p} isn't there");
+                prop_assert!(p != OWN);
+            }
+            // The same wishes and devices always give the same answer.
+            prop_assert_eq!(pick(&devices, &wanted, &previous, &defaults, &card), picked);
+        }
+
+        #[test]
+        fn it_picks_the_chosen_device_whenever_that_is_there(
+            devices in devices(), wanted in name(), previous in wish(), d0 in wish(), d1 in wish(), card in device_of(),
+        ) {
+            if !(devices.iter().any(|(n, _)| *n == wanted)) {
+                return Ok(());
+            }
+            let picked = pick(&devices, &Some(wanted.clone()), &previous, &[d0, d1], &card);
+            prop_assert_eq!(picked, Some(wanted));
+        }
+
+        #[test]
+        fn with_the_chosen_one_gone_it_prefers_another_output_of_the_same_device(
+            devices in devices(), wanted in name(), previous in wish(), d0 in wish(), d1 in wish(), card in device_of(),
+        ) {
+            if !(!devices.iter().any(|(n, _)| *n == wanted)) {
+                return Ok(());
+            }
+            let Some(&id) = card.get(&wanted) else { return Ok(()) };
+            let Some(first) = devices.iter().find(|(_, d)| *d == Some(id)).map(|(n, _)| n.clone()) else { return Ok(()) };
+            let picked = pick(&devices, &Some(wanted), &previous, &[d0, d1], &card);
+            prop_assert_eq!(picked, Some(first));
+        }
+
+        #[test]
+        fn with_no_wish_it_follows_the_previous_default_then_the_current_ones_then_the_first(
+            devices in devices(), previous in name(), d0 in name(), d1 in name(),
+        ) {
+            if !(!devices.is_empty()) {
+                return Ok(());
+            }
+            let there = |n: &String| devices.iter().any(|(d, _)| d == n);
+            let picked = pick(&devices, &None, &Some(previous.clone()), &[Some(d0.clone()), Some(d1.clone())], &HashMap::new()).unwrap();
+            let expected = if there(&previous) {
+                previous
+            } else if there(&d0) {
+                d0
+            } else if there(&d1) {
+                d1
+            } else {
+                devices[0].0.clone()
+            };
+            prop_assert_eq!(picked, expected);
+        }
     }
 }

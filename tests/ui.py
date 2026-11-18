@@ -2,7 +2,7 @@
 """Checks what the pointer does in the window: the real app, with a real pointer and
 keyboard, as a user's hand would work them.
 
-Usage: tests/ui.py BINARY
+Usage: tests/ui.py BINARY [--random [--seed N] [--steps N] [--until K]]
 
 Checked, on the Output's Equalizer page unless it says otherwise:
 
@@ -26,8 +26,25 @@ Checked, on the Output's Equalizer page unless it says otherwise:
   mic      on the Microphone's tab: a double-click on a point, a number, and a low-pass
            band, whose Gain slider is off and takes no double-click while its Width does
 
-Not checked: the app with a chain on, a window that isn't maximized, and a touchpad or
-a touchscreen.
+  keyboard Tab, Up, Right, Delete, plus and Escape on the graph, with no pointer once it
+           has the focus
+  window   the graph's checks again in a window that isn't maximized, and the sliders and
+           typing in the smallest one
+  chain    with the Output on a silent device: a point dragged in the window changes
+           the sound by what it should
+  plays    "Plays through" picked in the dropdown (the list opened with the pointer, the
+           entry chosen with the arrow keys): it's saved, the Output moves to that device,
+           and the dropdown shows it
+  printed  in every part, the app prints no GTK warning or critical, and no panic
+
+With --random it does random clicks, double-clicks, drags, scrolls, typed text and keys
+on the graph, the sliders, the numbers, the pages and both tabs, from a seed, and after
+each one checks that the app is running and printed nothing, that state.json is in range,
+that only one thing changed (and nothing on the other tab), and that the window's Preamp
+and Balance sliders show what's saved. A failure prints the seed: run it again with
+`--seed N --until K`.
+
+Not checked: a touchpad or a touchscreen.
 
 The accessibility actions the other tests use can't show these: they press a button
 without a pointer, and these are about what a press, a second press and the focus do.
@@ -45,7 +62,7 @@ Where things are in the window is read through accessibility (AT-SPI). Those pos
 can be off by a few pixels, and where the window is on screen isn't known, so the first
 double-click also measures both: the band it adds says exactly where the pointer was.
 """
-import json, math, os, shutil, subprocess, sys, tempfile, time
+import argparse, json, math, os, random, re, shutil, subprocess, sys, tempfile, time
 
 import gi
 
@@ -60,7 +77,8 @@ DISPLAYS = "org.gnome.Mutter.DisplayConfig"
 FREQ_MIN, FREQ_MAX, GAIN_LIMIT, AXIS_H = 20.0, 20000.0, 24.0, 22.0
 # Linux key codes.
 KEYS = {"1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11, "enter": 28, "up": 103,
-        "escape": 1, "k": 37, "minus": 74}  # the keypad's minus, which every layout has
+        "escape": 1, "k": 37, "minus": 74,  # the keypad's minus, which every layout has
+        "down": 108, "left": 105, "right": 106, "tab": 15, "delete": 111, "plus": 78}  # the keypad's plus
 LEFT_BUTTON = 272
 
 fails = []
@@ -154,11 +172,49 @@ class Hands:
         sleep(0.1)
         self.button(False)
 
+    def scroll(self, x, y, steps):
+        """Turns the wheel over a place: positive steps go down."""
+        self.go_to(x, y)
+        for _ in range(abs(steps)):
+            self.send("NotifyPointerAxisDiscrete", GLib.Variant("(ui)", (0, 1 if steps > 0 else -1)))
+            sleep(0.15)
+
+    window = None  # set by Window, so that keys are only sent while it has the focus
+
+    def require_focus(self):
+        """Stops the test if the Equalizer window isn't the one with the focus: keys sent
+        then would go to whatever has it, such as the terminal this was started from."""
+        if self.window is not None and not self.window.frame.get_state_set().contains(Atspi.StateType.ACTIVE):
+            raise RuntimeError("the Equalizer window doesn't have the focus, so the keys that would be sent now would go elsewhere")
+
     def type(self, *keys):
+        self.require_focus()
         for k in keys:
             for down in (True, False):
                 self.send("NotifyKeyboardKeycode", GLib.Variant("(ub)", (KEYS[k], down)))
                 sleep(0.04)
+
+    def key_code(self, code, down):
+        if code == 56 and down:
+            self.require_focus()
+        self.send("NotifyKeyboardKeycode", GLib.Variant("(ub)", (code, down)))
+        sleep(0.012)
+
+    def shrink_window(self, steps=220):
+        """Makes the window as small as it goes, with the desktop's keyboard resize (Alt+F8):
+        the first arrow key picks that edge and each key after moves it, about 6 pixels.
+        Width and height are done one after the other, as two edges at once go the wrong
+        way. The window's top left corner stays where it is."""
+        for edge, back in ((106, 105), (108, 103)):  # right edge, moved left; bottom edge, moved up
+            self.key_code(56, True)  # Alt
+            self.key_code(66, True)  # F8
+            self.key_code(66, False)
+            self.key_code(56, False)
+            sleep(0.4)
+            for code in (edge,) + (back,) * steps + (28,):
+                self.key_code(code, True)
+                self.key_code(code, False)
+            sleep(0.6)
 
     def stop(self):
         if self.session:
@@ -212,8 +268,9 @@ def box(obj):
 
 
 class Window:
-    def __init__(self, pid, hands):
+    def __init__(self, pid, hands, maximize=True):
         self.hands = hands
+        hands.window = self
         self.root = wait_for(lambda: ui_app(pid), timeout=10)
         if not self.root:
             raise RuntimeError("the window isn't reachable through accessibility (AT-SPI)")
@@ -222,7 +279,8 @@ class Window:
         if not self.frame:
             raise RuntimeError("the window didn't show")
         sleep(1.0)
-        self.maximize()
+        if maximize:
+            self.maximize()
         self.graph  # fails here if it isn't showing
         # How far the pointer must be sent from where accessibility says a thing is.
         # Measured by the first double-click on the graph.
@@ -238,8 +296,51 @@ class Window:
         x, y, w, h = box(obj)
         return self.screen(x + w * part, y + h / 2)
 
+    def visible_part(self, obj):
+        """The top and bottom of what can be seen of this: the window, and inside a scroller
+        only what's in the scroller. Also gives that scroller, if any."""
+        fx, fy, fw, fh = box(self.frame)
+        up, pane = obj.get_parent(), None
+        for _ in range(12):
+            if up is None:
+                break
+            if up.get_role_name() == "scroll pane":
+                pane = up
+                sx, sy, sw, sh = box(up)
+                top, bottom = max(fy, sy), min(fy + fh, sy + sh)
+                fy, fh = top, bottom - top
+                break
+            up = up.get_parent()
+        return fy, fy + fh, pane
+
+    def into_view(self, obj):
+        """In a small window the controls are in a scroller and some are below its edge:
+        scrolls this one into view with the scroller's bar. Raises if it can't, so
+        that a click isn't sent to somewhere that isn't the control."""
+        for attempt in range(8):
+            _, y, _, h = box(obj)
+            top, bottom, pane = self.visible_part(obj)
+            if y >= top and y + h <= bottom:
+                return
+            if pane is None:
+                break
+            # The scroller's own bar can be set through accessibility. (The wheel over it would
+            # change the slider under the pointer, and the focus doesn't scroll.)
+            bar = next((pane.get_child_at_index(i) for i in range(pane.get_child_count())
+                        if pane.get_child_at_index(i).get_role_name() == "scroll bar"), None)
+            if bar is None:
+                break
+            value = bar.get_value_iface()
+            now = Atspi.Value.get_current_value(value)
+            move = (y + h - bottom) if y + h > bottom else (y - top)
+            Atspi.Value.set_current_value(value, max(Atspi.Value.get_minimum_value(value), min(Atspi.Value.get_maximum_value(value), now + move)))
+            sleep(0.6)
+        raise RuntimeError(f"couldn't scroll “{obj.get_name()}” into view")
+
     def slider(self, name, part):
-        return self.middle(self.find(lambda o: o.get_role_name() == "slider" and o.get_name() == name, f"the {name} slider"), part)
+        obj = self.find(lambda o: o.get_role_name() == "slider" and o.get_name() == name, f"the {name} slider")
+        self.into_view(obj)
+        return self.middle(obj, part)
 
     def button(self, name):
         return self.find(lambda o: o.get_role_name() == "button" and o.get_name() == name, f"the button “{name}”")
@@ -306,9 +407,35 @@ class Window:
     def screen(self, x, y):
         return x + self.offset[0], y + self.offset[1]
 
+    def current(self):
+        """The tab and the page showing, read from the window: keys can change both (the
+        arrow keys on the tab strip or the sidebar do), as well as clicks."""
+        tab = next((o.get_name() for o in ui_all(self.root, lambda o: o.get_role_name() == "page tab")
+                    if o.get_state_set().contains(Atspi.StateType.SELECTED)), None)
+        row = None
+        lists = [l for l in ui_all(self.root, lambda o: o.get_role_name() == "list") if l.get_child_count() == 5 and l.get_selection_iface()]
+        if len(lists) == 1:
+            sel = lists[0].get_selection_iface()
+            row = next((i for i in range(5) if sel.is_child_selected(i)), None)
+        return tab, row
+
+    def slider_names(self):
+        return sorted({o.get_name() for o in ui_all(self.root, lambda o: o.get_role_name() == "slider") if o.get_name()})
+
+    def slider_value(self, name):
+        """What a slider shows, or None if it isn't there."""
+        hits = ui_all(self.root, lambda o: o.get_role_name() == "slider" and o.get_name() == name)
+        if not hits:
+            return None
+        try:
+            return Atspi.Value.get_current_value(hits[0].get_value_iface())
+        except (GLib.Error, AttributeError, TypeError):
+            return None
+
     def value(self, name):
         """The middle of the number beside the slider with this name."""
         label = self.find(lambda o: o.get_role_name() == "label" and o.get_name() == name, f"the {name} slider")
+        self.into_view(label)
         x, y, w, h = box(label.get_parent().get_child_at_index(1))
         return self.screen(x + w / 2, y + h / 2)
 
@@ -345,12 +472,12 @@ LOW_PASS = {"kind": "LowPass", "freq": 8000.0, "gain": 3.0, "q": 2.0, "enabled":
 class App:
     """The app with both chains off, so it makes no devices and touches no sound."""
 
-    def __init__(self, binary, tmp):
+    def __init__(self, binary, tmp, output_device=None):
         cfg = os.path.join(tmp, "cfg", "equalizer")
-        os.makedirs(cfg)
+        os.makedirs(cfg, exist_ok=True)
         self.state_path = os.path.join(cfg, "state.json")
         state = {
-            "output": {"enabled": False, "device": None, "preset": "Custom", "sound": sound(["autogain", "compressor", "loudness", "limiter"])},
+            "output": {"enabled": output_device is not None, "device": output_device, "preset": "Custom", "sound": sound(["autogain", "compressor", "loudness", "limiter"])},
             "mic": {"enabled": False, "device": None, "preset": "Custom", "sound": sound(["gate", "autogain", "compressor", "limiter"], [LOW_PASS])},
             "run_in_background": False,
             "autostart": False,
@@ -648,10 +775,445 @@ def mic(app, win, hands):
         win.tab("Output")
 
 
+# ---- Lines the app prints ----
+
+# Lines that are known and fine. GTK's own warnings and criticals are not: they mean a widget
+# was used wrongly. (Only what this machine's session prints belongs here, never what one
+# person's own settings cause.)
+KNOWN_LINES = [r"unknown resource \d+ op:7"]
+
+
+def bad_lines(text):
+    return [l for l in text.splitlines()
+            if re.search(r"WARNING|CRITICAL|panicked|\*\*\s*ERROR|Gtk-|Gdk-|Adwaita-", l) and not any(re.search(k, l) for k in KNOWN_LINES)]
+
+
+# ---- More cases ----
+
+
+def changes(before, after):
+    """What differs between two sounds: the indexes of the bands that changed (with the
+    band count if it changed), and whether anything else did."""
+    dn = len(after["bands"]) - len(before["bands"])
+    if dn == 0:
+        changed = [i for i in range(len(before["bands"])) if before["bands"][i] != after["bands"][i]]
+    else:
+        # A band added or removed shifts the ones after it, so match them up by what they are.
+        left = list(after["bands"])
+        unmatched = []
+        for i, b in enumerate(before["bands"]):
+            if b in left:
+                left.remove(b)
+            else:
+                unmatched.append(i)
+        # Of the bands that have no match, the removed ones aren't changes (the added are in `left`).
+        changed = unmatched[max(0, -dn):] if dn < 0 else unmatched
+    rest_b = {k: v for k, v in before.items() if k != "bands"}
+    rest_a = {k: v for k, v in after.items() if k != "bands"}
+    return changed, dn, rest_a != rest_b
+
+
+def keyboard(app, win, hands):
+    print("Keyboard only, on the graph", flush=True)
+    # One click for the focus. Single, on an empty spot: it adds nothing.
+    hands.click(*win.empty_spot())
+    sleep(0.5)
+    s0 = app.sound()
+    hands.type("plus")
+    s1 = app.saved(lambda s: len(s["bands"]) == len(s0["bands"]) + 1)
+    report(len(s1["bands"]) == len(s0["bands"]) + 1, f"the plus key adds a band ({len(s0['bands'])} -> {len(s1['bands'])} bands)")
+    hands.type("up", "up")
+    s2 = app.saved(lambda s: changes(s1, s)[0] != [])
+    ch, dn, other = changes(s1, s2)
+    gain = s2["bands"][ch[0]]["gain"] - s1["bands"][ch[0]]["gain"] if len(ch) == 1 else None
+    report(len(ch) == 1 and dn == 0 and not other and gain == 1.0, f"Up twice raises one band by 1 dB (bands changed: {ch}, gain change {gain})")
+    hands.type("tab", "up")
+    s3 = app.saved(lambda s: changes(s2, s)[0] != [])
+    ch2, dn, other = changes(s2, s3)
+    report(len(ch2) == 1 and ch2 != ch and dn == 0 and not other, f"Tab selects another band, and Up raises that one (bands changed: {ch} then {ch2})")
+    hands.type("right")
+    s4 = app.saved(lambda s: changes(s3, s)[0] != [])
+    ch3, dn, other = changes(s3, s4)
+    freq_up = len(ch3) == 1 and s4["bands"][ch3[0]]["freq"] > s3["bands"][ch3[0]]["freq"]
+    report(freq_up and dn == 0 and not other, f"Right raises the frequency of the selected band (bands changed: {ch3})")
+    hands.type("delete")
+    s5 = app.saved(lambda s: len(s["bands"]) == len(s4["bands"]) - 1)
+    report(len(s5["bands"]) == len(s4["bands"]) - 1, f"Delete removes the selected band ({len(s4['bands'])} -> {len(s5['bands'])} bands)")
+    hands.type("tab", "tab", "escape", "up")
+    s6 = app.settled()
+    ch, dn, _ = changes(s5, s6)
+    report(dn == 0 and len(ch) <= 1 and len(s6["bands"]) == len(s5["bands"]), "Escape leaves the graph without adding or removing a band")
+
+
+def chain_on(binary, tmp, hands):
+    print("With the Output on (a silent device)", flush=True)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from common import Tones, null_sink, unload, node_exists
+
+    name = "equi_out"
+    module = null_sink(name, "EquiTest")
+    sleep(0.5)
+    if not node_exists(name):
+        report(False, "couldn't make the silent device")
+        return
+    app = win = None
+    try:
+        sub = os.path.join(tmp, "chain")
+        os.makedirs(sub)
+        app = App(binary, sub, output_device=name)
+        if not wait_for(lambda: node_exists("equalizer_sink"), timeout=10):
+            raise RuntimeError("the app's virtual device didn't appear")
+        sleep(1.0)
+        win = Window(app.pid, hands)
+        freq = graph(app, win, hands)
+        tones = Tones(sub)
+        level = lambda f: tones.measure(name, "equalizer_sink", freq=f, seconds=0.8) - tones.measure(name, name, freq=f, seconds=0.8)
+        s = app.settled()
+        b = band_near(s, freq)
+        before = level(b["freq"])
+        # Down to 0 dB, straight down from where the point is.
+        w, h = win.graph_size()
+        hands.drag(*win.screen(*win.graph_point(b["freq"], b["gain"])), 0, h * b["gain"] / (2 * GAIN_LIMIT))
+        s = app.saved(lambda s: abs(band_near(s, b["freq"])["gain"]) < 0.5)
+        moved = band_near(s, b["freq"])
+        sleep(0.8)
+        after = level(b["freq"])
+        want = b["gain"] - moved["gain"]
+        report(abs((before - after) - want) <= 1.5,
+               f"a band dragged in the window changes the sound ({b['gain']:+.1f} -> {moved['gain']:+.1f} dB at {b['freq']:.0f} Hz: the sound fell {before - after:.1f} dB, wanted {want:.1f})")
+    finally:
+        if app:
+            app.close()
+        unload(module)
+
+
+def live_pick(binary, tmp, hands):
+    print("Plays through, picked in the dropdown (the Output on silent devices)", flush=True)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from common import null_sink, unload, node_exists, linked_to, plays_through
+
+    a, b = "equi_a", "equi_b"
+    mods = [null_sink(a, "EquiA"), null_sink(b, "EquiB")]
+    sleep(0.6)
+    app = None
+    try:
+        if not (node_exists(a) and node_exists(b)):
+            report(False, "couldn't make the silent devices")
+            return
+        sub = os.path.join(tmp, "live")
+        os.makedirs(sub)
+        app = App(binary, sub, output_device=a)
+        if not wait_for(lambda: node_exists("equalizer_sink"), timeout=10):
+            raise RuntimeError("the app's virtual device didn't appear")
+        sleep(1.0)
+        win = Window(app.pid, hands)
+        graph(app, win, hands)  # for where the pointer lands
+        report(plays_through(win) == "EquiA", f"the dropdown shows the saved device ({plays_through(win)})")
+
+        def pick(desc):
+            """Opens the list with the pointer, moves to the entry with the arrow keys, and takes it."""
+            shows = plays_through(win)
+            button = win.find(lambda o: o.get_role_name() == "toggle button" and o.get_name() == shows, "the Plays through button")
+            hands.click(*win.middle(button))
+            sleep(0.8)
+            rows = {}
+            for label in ui_all(win.root, lambda o: o.get_role_name() == "label" and o.get_name() in ("System default", "EquiA", "EquiB")):
+                o = label
+                for _ in range(4):
+                    if o is not None and o.get_role_name() == "list item":
+                        rows[label.get_name()] = o.get_index_in_parent()
+                        break
+                    o = o.get_parent() if o is not None else None
+            if desc not in rows or shows not in rows:
+                raise RuntimeError(f"the list doesn't show {desc} and {shows} (it shows {sorted(rows)})")
+            # Where the keyboard starts in the list isn't known, so go to the top first.
+            hands.type(*(["up"] * (len(rows) + 1)), *(["down"] * rows[desc]), "enter")
+            sleep(1.2)
+
+        pick("EquiB")
+        s2 = app.saved(lambda s: s is not None, chain="output")
+        saved = json.load(open(app.state_path))["output"]["device"]
+        report(saved == b, f"picking EquiB saves it ({saved})")
+        report(bool(wait_for(lambda: linked_to("equalizer_out") == [b], timeout=4)), f"and the Output plays through it ({', '.join(linked_to('equalizer_out')) or 'nothing'})")
+        report(plays_through(win) == "EquiB", f"and the dropdown shows it ({plays_through(win)})")
+        pick("System default")
+        saved = json.load(open(app.state_path))["output"]["device"]
+        report(saved is None, f"picking System default saves none ({saved})")
+        report(plays_through(win) == "System default", f"and the dropdown shows it ({plays_through(win)})")
+    finally:
+        if app:
+            app.close()
+        for m in mods:
+            unload(m)
+
+
+def recalibrate(app, win, hands):
+    """Where the pointer lands, measured again, after the window has moved or changed size:
+    a double-click on an empty spot adds a band where it really was, and that band is then
+    removed with the Delete key."""
+    w, h = win.graph_size()
+    gx, gy, _, _ = box(win.graph)
+    count = len(app.sound()["bands"])
+    sent = (gx + w * 0.25, gy + h * 0.25)
+    win.offset = (0.0, 0.0)
+    hands.click(*sent, times=2)
+    s = app.saved(lambda s: len(s["bands"]) == count + 1)
+    if len(s["bands"]) != count + 1:
+        raise RuntimeError("couldn't measure where the pointer lands in the smaller window")
+    added = s["bands"][-1]
+    landed = win.graph_point(added["freq"], added["gain"])
+    win.offset = (sent[0] - landed[0], sent[1] - landed[1])
+    print(f"       in the smaller window, things are {win.offset[0]:+.1f}, {win.offset[1]:+.1f} px from where accessibility puts them", flush=True)
+    hands.type("delete")
+    s = app.saved(lambda s: len(s["bands"]) == count)
+    if len(s["bands"]) != count:
+        raise RuntimeError("couldn't take the band used for measuring away again")
+
+
+def small_window(binary, tmp, hands):
+    print("A window that isn't maximized", flush=True)
+    sub = os.path.join(tmp, "small")
+    os.makedirs(sub)
+    app = App(binary, sub)
+    try:
+        win = Window(app.pid, hands, maximize=False)
+        full = lambda: box(win.frame)[2] == hands.width
+        if full():
+            action = win.frame.get_action_iface()
+            names = [action.get_action_name(i) for i in range(action.get_n_actions())]
+            if "window.toggle-maximized" in names:
+                action.do_action(names.index("window.toggle-maximized"))
+            wait_for(lambda: not full(), timeout=3)
+            sleep(1.0)
+        x, y, wd, ht = box(win.frame)
+        print(f"       the window is {wd} x {ht}", flush=True)
+        report(wd < hands.width, "the window isn't maximized")
+        graph(app, win, hands)
+        values(app, win, hands, 2000.0)
+        # The smallest the window allows, by the keyboard (a drag on its corner doesn't resize it
+        # here). The top left corner stays where it is, so the pointer's offset still holds.
+        print("The smallest size the window allows", flush=True)
+        x, y, wd, ht = box(win.frame)
+        hands.shrink_window()
+        sleep(1.0)
+        _, _, w2, h2 = box(win.frame)
+        if not report(w2 < wd and h2 < ht, f"dragging the corner makes the window smaller ({wd} x {ht} -> {w2} x {h2})"):
+            return
+        report(w2 >= 300 and h2 >= 300, "and it stops at a size that still has room for the graph")
+        recalibrate(app, win, hands)
+        # The Gain, Width and Frequency sliders belong to the selected band: take the one at 2 kHz.
+        keep = band_near(app.sound(), 2000.0)
+        hands.click(*win.screen(*win.graph_point(keep["freq"], keep["gain"])))
+        sleep(0.8)
+        sliders(app, win, hands, 2000.0)
+        typing(app, win, hands, 1000.0)
+    finally:
+        app.close()
+
+
+# ---- Random ----
+
+RANGES = {"freq": (10.0, 24_000.0), "gain": (-24.0, 24.0), "q": (0.1, 20.0)}
+
+
+def in_range(sound):
+    """What's wrong with a saved sound, if anything."""
+    if len(sound["bands"]) > 32:
+        return f"{len(sound['bands'])} bands"
+    for b in sound["bands"]:
+        for k, (lo, hi) in RANGES.items():
+            if not (lo <= b[k] <= hi):
+                return f"a band's {k} is {b[k]}"
+    if not (-24.0 <= sound["preamp"] <= 20.0):
+        return f"preamp {sound['preamp']}"
+    if not (-100.0 <= sound["balance"] <= 100.0):
+        return f"balance {sound['balance']}"
+    return None
+
+
+def random_run(app, win, hands, seed, steps, until):
+    print(f"Random: seed {seed}", flush=True)
+    rng = random.Random(seed)
+    graph(app, win, hands)  # puts the pointer's offset right, and gives the graph a band to find
+    EQ = 2  # the equalizer is the third row of the sidebar on both tabs (src/model.rs, Direction::chain)
+    state = {"tab": "Output", "pages": {"Output": EQ, "Microphone": EQ}}
+    page = lambda: state["pages"][state["tab"]]  # the graph is on the equalizer's page only
+    chain = lambda: "output" if state["tab"] == "Output" else "mic"
+    done = []
+
+    noted = []
+
+    def graph_here():
+        """Whether the graph is showing. On the page the sidebar says is the EQ's it should
+        be; when it isn't, the step is skipped and noted (the sidebar and the page disagree)."""
+        if page() != EQ:
+            return False
+        if ui_all(win.root, lambda o: o.get_role_name() == "frame" and o.get_name().startswith("Equalizer graph")):
+            return True
+        noted.append(f"step {len(done) + 1}: the sidebar has the EQ page selected on the {state['tab']} tab, but the graph isn't showing")
+        return False
+
+    def points():
+        s = app.sound(chain())
+        return [win.screen(*win.graph_point(b["freq"], b["gain"])) for b in (s["bands"] if s else [])]
+
+    def somewhere():
+        w, h = win.graph_size()
+        x, y, _, _ = box(win.graph)
+        return win.screen(x + rng.uniform(0.05, 0.95) * w, y + rng.uniform(0.05, 0.95) * h)
+
+    def act_point(kind):
+        if not graph_here():
+            return None
+        pts = points()
+        if not pts:
+            return None
+        x, y = rng.choice(pts)
+        if kind == "click":
+            hands.click(x, y)
+            return "click on a point"
+        if kind == "double":
+            hands.click(x, y, times=2)
+            return "double-click on a point"
+        w, h = win.graph_size()
+        dx, dy = rng.uniform(-0.2, 0.2) * w, rng.uniform(-0.3, 0.3) * h
+        hands.drag(x, y, dx, dy)
+        return f"drag a point by {dx:.0f}, {dy:.0f}"
+
+    def act_empty():
+        if not graph_here():
+            return None
+        hands.click(*somewhere(), times=rng.choice([1, 1, 2]))
+        return "click(s) somewhere on the graph"
+
+    def act_scroll():
+        if not graph_here():
+            return None
+        pts = points()
+        x, y = rng.choice(pts) if pts and rng.random() < 0.5 else somewhere()
+        n = rng.choice([-3, -1, 1, 3])
+        hands.scroll(x, y, n)
+        return f"scroll {n} over the graph"
+
+    def act_slider():
+        names = win.slider_names()
+        if not names:
+            return None
+        name = rng.choice(names)
+        hands.click(*win.slider(name, rng.uniform(0.1, 0.9)), times=rng.choice([1, 2]))
+        return f"click(s) on the {name} slider"
+
+    def act_number():
+        names = win.slider_names()
+        if not names:
+            return None
+        name = rng.choice(names)
+        hands.click(*win.value(name))
+        sleep(0.4)
+        keys = [rng.choice(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "k", "minus", "escape"]) for _ in range(rng.randint(1, 4))]
+        hands.type(*keys, rng.choice(["enter", "enter", "escape"]))
+        return f"typed {' '.join(keys)} into the {name} number"
+
+    def act_keys():
+        keys = [rng.choice(["tab", "up", "down", "left", "right", "delete", "plus", "escape"]) for _ in range(rng.randint(1, 4))]
+        hands.type(*keys)
+        # Each key can change a band (and Tab moves on to another), so up to as many as typed.
+        state["keys"] = len([k for k in keys if k in ("up", "down", "left", "right", "delete", "plus")])
+        return f"keys {' '.join(keys)}"
+
+    def act_page():
+        row = EQ if rng.random() < 0.5 else rng.randrange(5)
+        win.page(row)
+        state["pages"][state["tab"]] = row
+        return f"page {row}"
+
+    def act_tab():
+        state["tab"] = "Microphone" if state["tab"] == "Output" else "Output"
+        win.tab(state["tab"])
+        return f"the {state['tab']} tab"
+
+    actions = [(5, lambda: act_point("click")), (5, lambda: act_point("double")), (6, lambda: act_point("drag")), (3, act_empty),
+               (2, act_scroll), (5, act_slider), (4, act_number), (4, act_keys), (2, act_page), (1, act_tab)]
+    bag = [a for w_, a in actions for _ in range(w_)]
+    log_pos = len(open(app.err, errors="replace").read())
+    ok = True
+    for k in range(1, (until or steps) + 1):
+        before = {c: app.sound(c) for c in ("output", "mic")}
+        state["keys"] = None
+        try:
+            say = rng.choice(bag)()
+        except RuntimeError as e:
+            shown = sorted({f"{o.get_role_name()}:{o.get_name()}" for o in ui_all(win.root, lambda o: o.get_role_name() in ("frame", "page tab", "list", "slider", "toggle button"))})
+            print(f"         {e}\n         tab {state['tab']}, pages {state['pages']}; showing: {', '.join(shown)[:600]}", flush=True)
+            raise
+        if say is None:
+            say = "(nothing to do)"
+        sleep(1.5)
+        tab, row = win.current()
+        if tab:
+            state["tab"] = tab
+            if row is not None:
+                state["pages"][tab] = row
+        problems = []
+        if app.p.poll() is not None:
+            problems.append(f"the app has exited with code {app.p.returncode}")
+        text = open(app.err, errors="replace").read()
+        fresh, log_pos = text[log_pos:], len(text)
+        problems += [f"the app printed: {l}" for l in bad_lines(fresh)]
+        after = {c: app.sound(c) for c in ("output", "mic")}
+        for c in ("output", "mic"):
+            if after[c] is None:
+                problems.append(f"state.json is unreadable ({c})")
+                continue
+            wrong = in_range(after[c])
+            if wrong:
+                problems.append(f"{c}: out of range: {wrong}")
+        if all(after.values()) and all(before.values()):
+            shown = chain()
+            other = "mic" if shown == "output" else "output"
+            if after[other] != before[other]:
+                problems.append(f"the {other} chain changed while the {state['tab']} tab was showing")
+            changed, dn, _ = changes(before[shown], after[shown])
+            if state["keys"] is not None:
+                if len(changed) + abs(dn) > max(state["keys"], 1):
+                    problems.append(f"more changed than the {state['keys']} keys typed: bands {changed}, band count {dn:+d}")
+            elif abs(dn) > 1 or (dn and changed) or len(changed) > 1:
+                problems.append(f"more than one thing changed: bands {changed}, band count {dn:+d}")
+            # The window shows what's saved: the EQ page's two sliders.
+            if page() == EQ and after[shown]:
+                # Accessibility gives a slider's position from 0 to 1 across its range.
+                for name, key, lo, hi in (("Preamp", "preamp", -24.0, 20.0), ("Balance", "balance", -100.0, 100.0)):
+                    v = win.slider_value(name)
+                    if v is not None and abs(lo + v * (hi - lo) - after[shown][key]) > 0.01 * (hi - lo):
+                        problems.append(f"the {name} slider shows {lo + v * (hi - lo):.1f}, state.json has {after[shown][key]:.1f}")
+        done.append((k, say, problems))
+        print(f"  {k:>3}. {say}{'  <- FAIL' if problems else ''}", flush=True)
+        if problems:
+            for pr in problems:
+                print(f"         {pr}", flush=True)
+                fails.append(f"step {k}: {pr}")
+            ok = False
+            break
+    if not ok:
+        print(f"\nRun again: tests/ui.py BINARY --random --seed {seed} --until {done[-1][0]}", flush=True)
+    else:
+        report(True, f"{steps} random steps, none broke a rule")
+    for n in noted:
+        print(f"  note {n}", flush=True)
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1].startswith("-"):
+    ap = argparse.ArgumentParser(usage="tests/ui.py BINARY [--random [--seed N] [--steps N] [--until K]]", add_help=False)
+    ap.add_argument("binary")
+    ap.add_argument("--random", action="store_true")
+    ap.add_argument("--seed", type=int)
+    ap.add_argument("--steps", type=int, default=40)
+    ap.add_argument("--until", type=int)
+    try:
+        args = ap.parse_args()
+    except SystemExit:
         sys.exit(__doc__.split("\n\n")[1])
-    binary = os.path.abspath(sys.argv[1])
+    binary = os.path.abspath(args.binary)
     if not os.access(binary, os.X_OK):
         sys.exit(f"Not an executable: {binary}")
     if not shutil.which("gdbus"):
@@ -663,27 +1225,54 @@ def main():
     except (GLib.Error, RuntimeError, StopIteration) as e:
         sys.exit(f"This test sends its pointer and keys through GNOME (org.gnome.Mutter.RemoteDesktop), which isn't here: {getattr(e, 'message', e)}")
     tmp = tempfile.mkdtemp(prefix="equi")
-    app = None
+    messages = ""
     print("Don't touch the pointer or the keyboard, and keep the Equalizer window uncovered, until this finishes.\n", flush=True)
+
+    def section(name, fn, *a, **kw):
+        """One part with its own copy of the app, so a failure in one leaves the rest alone."""
+        nonlocal messages
+        sub = os.path.join(tmp, name)
+        os.makedirs(sub, exist_ok=True)
+        app = None
+        try:
+            app = App(binary, sub)
+            win = Window(app.pid, hands)
+            fn(app, win, hands, *a, **kw)
+        except (RuntimeError, GLib.Error) as e:
+            report(False, f"{name} stopped: {getattr(e, 'message', e)}")
+        finally:
+            if app:
+                app.close()
+                text = open(app.err, errors="replace").read()
+                messages += text
+                lines = bad_lines(text)
+                report(not lines, f"{name}: the app printed no warnings ({lines[0][:120] if lines else 'none'})")
+
     try:
-        app = App(binary, tmp)
-        win = Window(app.pid, hands)
-        freq = graph(app, win, hands)
-        values(app, win, hands, freq)
-        freq = sliders(app, win, hands, freq)
-        freq = typing(app, win, hands, freq)
-        left_open(app, win, hands, freq)
-        effect(app, win, hands)
-        mic(app, win, hands)
+        if args.random:
+            seed = args.seed if args.seed is not None else random.randrange(1 << 30)
+            section("random", random_run, seed, args.steps, args.until)
+        else:
+            def checks(app, win, hands):
+                freq = graph(app, win, hands)
+                values(app, win, hands, freq)
+                freq = sliders(app, win, hands, freq)
+                freq = typing(app, win, hands, freq)
+                left_open(app, win, hands, freq)
+                effect(app, win, hands)
+                mic(app, win, hands)
+
+            section("pointer", checks)
+            section("keyboard", keyboard)
+            small_window(binary, tmp, hands)
+            chain_on(binary, tmp, hands)
+            live_pick(binary, tmp, hands)
     except (RuntimeError, GLib.Error) as e:
         report(False, f"stopped: {getattr(e, 'message', e)}")
     finally:
         hands.stop()
-        if app:
-            app.close()
-            messages = open(app.err, errors="replace").read()
-            if fails and messages:
-                print("\nThe app's messages:\n" + messages[-3000:])
+        if fails and messages:
+            print("\nThe app's messages:\n" + messages[-3000:])
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{len(fails)} failed" if fails else "\nAll passed")
     sys.exit(1 if fails else 0)

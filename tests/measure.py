@@ -7,6 +7,9 @@ volume. It needs an X display (DISPLAY) for the window. Usage: tests/measure.py 
 """
 import json, math, os, re, shutil, signal, struct, subprocess, sys, tempfile, time, wave
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import bad_app_lines
+
 BIN = os.path.abspath(sys.argv[1])
 RATE = 48000
 LEVEL_DB = -20.0
@@ -14,6 +17,7 @@ tmp = tempfile.mkdtemp(prefix="eqtest")
 cfg = os.path.join(tmp, "cfg", "equalizer")
 os.makedirs(cfg)
 fails = []
+app_stderr = open(os.path.join(tmp, "app-stderr.txt"), "a")  # what the app prints, checked at the end
 
 
 def run(*a):
@@ -104,7 +108,7 @@ def default_state():
     """The app writes its own defaults on the way out, which keeps this test honest."""
     state = os.path.join(cfg, "state.json")
     env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
-    p = subprocess.Popen([BIN], env=env, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen([BIN], env=env, stderr=app_stderr)
     time.sleep(2.5)
     p.terminate()
     p.wait()
@@ -122,7 +126,7 @@ class App:
         mutate(s["output"]["sound"])
         json.dump(s, open(os.path.join(cfg, "state.json"), "w"))
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
-        self.p = subprocess.Popen([BIN], env=env, stderr=subprocess.DEVNULL)
+        self.p = subprocess.Popen([BIN], env=env, stderr=app_stderr)
         time.sleep(1.8)
         # The app's volume is the silent device's, at whatever it was last set to, which
         # would shift every measurement. The raw values keep any left/right difference.
@@ -540,6 +544,10 @@ ret = returning_device()
 fallback = run("pactl", "load-module", "module-null-sink", "sink_name=eqfallback",
                "sink_properties=device.description=\"AAA EqFallback\"")
 time.sleep(0.5)
+# The app goes back to the default from before it started while its device is gone, so
+# that default must be the silent fallback, not whatever the session has configured.
+default_before = run("pactl", "get-default-sink")
+run("pactl", "set-default-sink", "eqfallback")
 device_before = template["output"]["device"]
 template["output"]["device"] = "eqreturn"
 with App(lambda s: None):
@@ -556,6 +564,8 @@ with App(lambda s: None):
     if not ok:
         fails.append("comes back to its device")
 template["output"]["device"] = device_before
+if default_before:
+    run("pactl", "set-default-sink", default_before)
 run("pactl", "unload-module", ret)
 run("pactl", "unload-module", fallback)
 
@@ -605,6 +615,14 @@ else:
     print("  ok   the default is handed back on quit")
 
 run("pactl", "unload-module", module)
+printed = bad_app_lines(open(os.path.join(tmp, "app-stderr.txt"), errors="replace").read())
+print("The app prints no warnings")
+if printed:
+    fails.append("the app printed warnings")
+    for l in printed[:8]:
+        print("  FAIL " + l[:200])
+else:
+    print("  ok   nothing")
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n{len(fails)} failed" if fails else "\nAll passed")
 sys.exit(1 if fails else 0)

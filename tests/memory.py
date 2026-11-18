@@ -532,7 +532,7 @@ class App:
         json.dump(state, open(self.state_path, "w"))
         self.err = os.path.join(tmp, "stderr.txt")
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"))
-        self.p = subprocess.Popen(shlex.split(wrap) + [binary], env=env, stdout=subprocess.DEVNULL, stderr=open(self.err, "w"))
+        self.p = subprocess.Popen(shlex.split(wrap) + [binary], env=env, stdout=subprocess.DEVNULL, stderr=open(self.err, "a"))
         self.players = []
         if wait_for(lambda: self.p.poll() is not None, timeout=1.0):
             raise RuntimeError("the app exited right away: is another copy running?")
@@ -947,6 +947,15 @@ def main():
                 else:
                     run("pw-metadata", "-n", "default", "-d", "0", key)
                 print(f"  note: the test put {key} back")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from common import bad_app_lines
+
+            printed = bad_app_lines(open(os.path.join(tmp, "stderr.txt"), errors="replace").read())
+            print("The app prints no warnings")
+            report(not printed, "nothing" if not printed else printed[0][:200])
+        except OSError:
+            pass
         shutil.rmtree(tmp, ignore_errors=True)
         if recorded:
             save_report(saved_to, stamp, binary, chosen, o, renderers)

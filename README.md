@@ -194,6 +194,8 @@ entry in the `EFFECTS` table in `model.rs`, plus a place in `Direction::chain`.
     DISPLAY=:0 python3 tests/mic.py target/release/equalizer
     DISPLAY=:0 python3 tests/memory.py target/release/equalizer
     DISPLAY=:0 python3 tests/ui.py target/release/equalizer
+    DISPLAY=:0 python3 tests/ui.py target/release/equalizer --random --seed 1
+    DISPLAY=:0 python3 tests/events.py target/release/equalizer
 
 The second one runs the real app with tones going to a temporary silent device. It
 compares what comes out with what the graph shows, and it needs a display and a
@@ -207,6 +209,14 @@ plays its tones into a temporary fake one. It also clicks through the Microphone
 using accessibility (AT-SPI), so it needs the Python bindings for it (`python3-gi`
 with `Atspi` 2.0), and the window must stay uncovered. Quit Equalizer before running
 either one, as only one copy can run.
+
+`tests/events.py` does random things to the running app from a seed: volume changes
+from both sides (with late and repeated reports), devices going and coming back, the
+default changing, Active switched, a player starting and stopping. After each it checks
+rules that must always hold (the app is running, Active on is as loud as straight into
+the device, Equalizer's volume is the device's, the Output plays through the right
+device, nothing records by itself, a player keeps playing, `state.json` says what the
+window shows). A failure prints the seed: run it again with `--seed N --until K`.
 
 The fourth looks for memory leaks. It repeats what a user does again and again
 (playing music, hiding and showing the window, switching pages and tabs, turning

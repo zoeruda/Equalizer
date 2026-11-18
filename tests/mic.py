@@ -20,6 +20,9 @@ The names run only those parts. With none, it runs all three.
 """
 import json, math, os, re, shutil, signal, struct, subprocess, sys, tempfile, time, wave
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import bad_app_lines
+
 import gi
 
 gi.require_version("Atspi", "2.0")
@@ -42,6 +45,7 @@ tmp = tempfile.mkdtemp(prefix="eqmic")
 cfg = os.path.join(tmp, "cfg", "equalizer")
 os.makedirs(cfg)
 fails = []
+app_stderr = open(os.path.join(tmp, "app-stderr.txt"), "a")  # what the app prints, checked at the end
 
 
 def run(*a):
@@ -384,7 +388,7 @@ class App:
         json.dump(state, open(self.state_path, "w"))
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
         # --background starts with the window hidden, as at login.
-        self.p = subprocess.Popen([BIN] + (["--background"] if hidden else []), env=env, stderr=subprocess.DEVNULL)
+        self.p = subprocess.Popen([BIN] + (["--background"] if hidden else []), env=env, stderr=app_stderr)
         self.volume = None
         if wait_for(lambda: self.p.poll() is not None, timeout=1.0):
             raise RuntimeError("the app exited right away: is another copy running?")
@@ -651,6 +655,9 @@ def main():
                 else:
                     run("pw-metadata", "-n", "default", "-d", "0", key)
                 print(f"  note: the test put {key} back")
+        printed = bad_app_lines(open(os.path.join(tmp, "app-stderr.txt"), errors="replace").read())
+        print("The app prints no warnings")
+        report(not printed, "nothing" if not printed else printed[0][:200])
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{len(fails)} failed" if fails else "\nAll passed")
     sys.exit(1 if fails else 0)
