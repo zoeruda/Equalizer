@@ -4,6 +4,8 @@
 /flatpak-repo
 /Equalizer.flatpak
 __pycache__/
+# Failing seeds that proptest saves when a random test fails (not kept in the repo)
+/proptest-regressions/
 /packaging/arch/*
 !/packaging/arch/PKGBUILD
 

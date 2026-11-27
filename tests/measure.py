@@ -121,11 +121,13 @@ template["output"]["sound"]["effects"]["limiter"]["enabled"] = False
 
 
 class App:
-    def __init__(self, mutate):
+    def __init__(self, mutate, trace=False):
         s = json.loads(json.dumps(template))
         mutate(s["output"]["sound"])
         json.dump(s, open(os.path.join(cfg, "state.json"), "w"))
         env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(tmp, "cfg"), GDK_BACKEND="x11", GSK_RENDERER="cairo")
+        if trace:
+            env["EQUALIZER_TRACE"] = "1"
         self.p = subprocess.Popen([BIN], env=env, stderr=app_stderr)
         time.sleep(1.8)
         # The app's volume is the silent device's, at whatever it was last set to, which
@@ -519,6 +521,69 @@ with App(lambda s: None):
     if not ok:
         fails.append("late volume reports")
     check("after the reports: through the app vs straight into the device", measure(1000) - measure(1000, into="eqmeasure"), 0.0, tol=0.3)
+
+print("A headphone button just after a change from the desktop")
+# Race 2 of the 0.0.8 plan. The desktop sets 70% while the headphones are at 50%. They
+# report the 50% once more a few ms later (as above), and then the person presses their
+# volume-down button before they've applied the 70%: they report 49%, a whole step from
+# the 50%, which is a change made on the device and must be followed. The app used to take
+# it for the 50% reported once more (anything within 0.75 dB of it counted), and kept
+# showing 70% while the headphones played 49%. The gap is how soon after the change the
+# press comes, within the half second the late report is waited for.
+
+# Up and down, after a change in either direction.
+for to, pressed, gap_ms in [(t, p, g) for t, p in ((70, 49), (70, 51), (30, 49), (30, 51)) for g in (100, 300, 450)]:
+    with App(lambda s: None, trace=True) as app:
+        run("pactl", "set-sink-volume", "eqmeasure", "50%")
+        time.sleep(0.8)
+        run("pactl", "set-sink-volume", "equalizer_sink", f"{to}%")
+        time.sleep(0.008)
+        run("pactl", "set-sink-volume", "eqmeasure", "50%")
+        time.sleep(gap_ms / 1000)
+        run("pactl", "set-sink-volume", "eqmeasure", f"{pressed}%")
+        time.sleep(1.5)
+        shown = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "equalizer_sink"))
+        device = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "eqmeasure"))
+        ok = shown == device == [str(pressed)] * 2
+        print(f"  {'ok  ' if ok else 'FAIL'} set {to}%, then {pressed}% on the device {gap_ms} ms later: the app shows {'/'.join(shown)}%, the device is at {'/'.join(device)}%")
+        if not ok:
+            fails.append(f"a button press {gap_ms} ms after a change from the desktop")
+            lines = [l for l in open(os.path.join(tmp, "app-stderr.txt"), errors="replace").read().splitlines() if "volume:" in l]
+            for l in lines[-8:]:
+                print("       " + l)
+
+print("The headphones' button back to a volume the desktop just stepped through")
+# The volume keys step up (or down) several times and each step reaches the headphones.
+# Then the headphones' own button goes the other way. Its steps are the same size, so it
+# lands on a volume the keys just passed through, or close to it. The app used to take
+# that for one of its own changes coming back, and kept showing the keys' volume. Each
+# step is reported as Bluetooth headphones do: the new volume, the old one once more,
+# the new one.
+
+for steps, presses in (((50, 56, 62, 69), (62, 63, 56)), ((50, 44, 38, 33), (38, 37, 44))):
+    for pressed, gap_ms in [(p, g) for p in presses for g in (150, 450)]:
+        with App(lambda s: None, trace=True) as app:
+            run("pactl", "set-sink-volume", "eqmeasure", f"{steps[0]}%")
+            time.sleep(0.8)
+            for before, to in zip(steps, steps[1:]):
+                time.sleep(0.2)
+                run("pactl", "set-sink-volume", "equalizer_sink", f"{to}%")
+                time.sleep(0.008)
+                run("pactl", "set-sink-volume", "eqmeasure", f"{before}%")
+                run("pactl", "set-sink-volume", "eqmeasure", f"{to}%")
+            time.sleep(gap_ms / 1000)
+            run("pactl", "set-sink-volume", "eqmeasure", f"{pressed}%")
+            time.sleep(1.5)
+            shown = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "equalizer_sink"))
+            device = re.findall(r"(\d+)%", run("pactl", "get-sink-volume", "eqmeasure"))
+            ok = shown == device == [str(pressed)] * 2
+            keys = " ".join(f"{s}%" for s in steps[1:])
+            print(f"  {'ok  ' if ok else 'FAIL'} keys {keys}, then {pressed}% on the device {gap_ms} ms later: the app shows {'/'.join(shown)}%, the device is at {'/'.join(device)}%")
+            if not ok:
+                fails.append(f"a button press back to {pressed}% after the keys")
+                lines = [l for l in open(os.path.join(tmp, "app-stderr.txt"), errors="replace").read().splitlines() if "volume:" in l]
+                for l in lines[-4:]:
+                    print("       " + l)
 
 print("The Output comes back to its device")
 # Bluetooth headphones replace their output when they switch to their headset profile and

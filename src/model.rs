@@ -1815,20 +1815,6 @@ mod random_input {
             })
     }
 
-    /// Whether two JSON values are the same, numbers to within a part in 10^12.
-    fn same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-        use serde_json::Value::*;
-        match (a, b) {
-            (Number(x), Number(y)) => {
-                let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
-                (x - y).abs() <= 1e-12 * x.abs().max(y.abs())
-            }
-            (Array(x), Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
-            (Object(x), Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w))),
-            _ => a == b,
-        }
-    }
-
     fn assert_in_range(s: &Sound) -> Result<(), TestCaseError> {
         prop_assert!(s.bands.len() <= MAX_BANDS);
         for b in &s.bands {
@@ -1865,10 +1851,9 @@ mod random_input {
             s.sanitize();
             // As the state file and the preset files are written and read.
             let back: Sound = serde_json::from_slice(&serde_json::to_vec_pretty(&s).unwrap()).unwrap();
-            // Not exactly: serde_json's default number reading can be one step off in the
-            // last digit (its `float_roundtrip` feature would fix that; a find of Part 4
-            // of the 0.0.8 plan, with no audible effect).
-            prop_assert!(same(&serde_json::to_value(&back).unwrap(), &serde_json::to_value(&s).unwrap()), "{back:?} {s:?}");
+            // Exactly: serde_json's default number reading can be one step off in the last
+            // digit, which its `float_roundtrip` feature (on in Cargo.toml) prevents.
+            prop_assert_eq!(back, s);
         }
 
         #[test]

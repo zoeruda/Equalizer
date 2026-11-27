@@ -32,9 +32,11 @@ pub(super) struct VolumeSync {
     pub(super) synced: bool,
     /// Volumes recently sent to the real device, to recognize them coming back.
     pub(super) sent: VecDeque<Sent>,
-    /// The volume last set on Equalizer's output, until it shows there. Setting the
-    /// same one again before then would do nothing useful.
-    pub(super) shown: Option<(Volume, Instant)>,
+    /// The volumes set on Equalizer's output that it hasn't reported back yet, oldest
+    /// first (it reports in order). The last is what it will show: setting the same one
+    /// again would do nothing useful, and a report of an earlier one is the app's own
+    /// change coming back, not a change made on the desktop.
+    pub(super) shown: VecDeque<(Volume, Instant)>,
 }
 
 impl VolumeSync {
@@ -42,7 +44,7 @@ impl VolumeSync {
     /// before passing changes on.
     pub(super) fn device_changed(&mut self) {
         self.sent.clear();
-        self.shown = None;
+        self.shown.clear();
         self.synced = false;
     }
 
@@ -50,7 +52,7 @@ impl VolumeSync {
     pub(super) fn sink_gone(&mut self) {
         self.sink_volume = None;
         self.synced = false;
-        self.shown = None;
+        self.shown.clear();
     }
 
     /// The real device reports its volume, which may be a change made anywhere. Shows it
@@ -59,12 +61,52 @@ impl VolumeSync {
     pub(super) fn device_reported(&mut self, volume: Option<&Volume>, sink: bool, now: Instant) -> Option<Action> {
         self.sent.retain(|s| now.duration_since(s.at) < ECHO_WAIT);
         let v = volume?;
-        if is_echo(&self.sent, v, now) {
-            trace!("volume: device reports {}, ignored as an echo of what was sent", db_text(v));
+        for s in self.sent.iter_mut().filter(|s| s.volume.close(v, ECHO_DB)) {
+            s.settled = true;
+        }
+        // The device reports changes in the order it got them, so once a later one has
+        // come back, an earlier one that came back before it won't again: its volume
+        // reported from now on was set on the device, by a button that steps as the
+        // desktop's keys do.
+        // (A report near several is taken for the oldest, so that none is given up early.)
+        if let Some(i) = self.sent.iter().position(|s| s.volume.close(v, ECHO_DB)) {
+            self.sent[i].back = true;
+            let mut n = 0;
+            self.sent.retain(|s| {
+                n += 1;
+                n > i || !s.back
+            });
+        }
+        if let Some(kind) = echo_kind(&self.sent, v, now) {
+            match kind {
+                Echo::Sent => trace!("volume: device reports {}, ignored as an echo of what was sent", db_text(v)),
+                Echo::Before => trace!(
+                    "volume: device reports {}, ignored as the volume it had before, reported once more",
+                    db_text(v)
+                ),
+            }
             return None;
         }
+        // A change made on the device: what was sent before is no longer what it has, and
+        // what has come back can be chosen again, by the next press.
+        self.sent.retain(|s| !s.back);
+        for s in &mut self.sent {
+            s.settled = true;
+        }
         let shown = v.for_channels(2);
-        if self.sink_volume.as_ref().is_some_and(|s| s.close(&shown, SAME_DB)) {
+        // What Equalizer's output has, or is about to have: a volume just set on it that it
+        // hasn't reported yet counts, or two reports close together would undo each other.
+        self.shown.retain(|(_, at)| now.duration_since(*at) < ECHO_WAIT);
+        if let Some((pending, _)) = self.shown.back() {
+            if pending.close(&shown, SAME_DB) {
+                // Not "synced": the output hasn't reported it, so it has shown nothing yet.
+                trace!(
+                    "volume: device reports {}, what's already on its way to Equalizer's device",
+                    db_text(v)
+                );
+                return None;
+            }
+        } else if self.sink_volume.as_ref().is_some_and(|s| s.close(&shown, SAME_DB)) {
             trace!("volume: device reports {}, already what Equalizer's device has", db_text(v));
             self.synced = true;
             return None;
@@ -76,8 +118,17 @@ impl VolumeSync {
     /// Equalizer's output reports a volume: passes a change on to the real device.
     pub(super) fn sink_reported(&mut self, v: Volume, device: RealDevice, sink: bool, now: Instant) -> Option<Action> {
         trace!("volume: Equalizer's device reports {}", db_text(&v));
-        if self.shown.as_ref().is_some_and(|(s, _)| s.close(&v, SAME_DB)) {
-            self.shown = None;
+        self.shown.retain(|(_, at)| now.duration_since(*at) < ECHO_WAIT);
+        if let Some(i) = self.shown.iter().position(|(s, _)| s.close(&v, SAME_DB)) {
+            self.shown.drain(..=i);
+            self.sink_volume = Some(v.clone());
+            if !self.shown.is_empty() {
+                // The app's own change, and a newer one is still on its way: not one made on
+                // the desktop, and not the volume to compare with the device's yet.
+                trace!("volume: that's what was shown earlier, a newer volume is still on its way");
+                return None;
+            }
+            return self.shown_arrived(&v, device, sink, now);
         }
         self.sink_volume = Some(v.clone());
         let current = match device {
@@ -91,8 +142,22 @@ impl VolumeSync {
             }
             RealDevice::Volume(c) => c,
         };
-        if v.close(&current.for_channels(v.channels.len()), SAME_DB) {
-            trace!("volume: same as the device's {}, nothing to pass on", db_text(current));
+        // What the device is taken to have: the last volume sent to it while that's still
+        // on its way (it reports a change late, and the volume it last reported is then
+        // the one from before), otherwise the one it last reported.
+        let on_its_way = self
+            .sent
+            .iter()
+            .rev()
+            .find(|s| !s.settled && now.duration_since(s.at) < ECHO_WAIT)
+            .map(|s| &s.volume);
+        let expected = on_its_way.unwrap_or(current);
+        if v.close(&expected.for_channels(v.channels.len()), SAME_DB) {
+            trace!(
+                "volume: same as the device's {}{}, nothing to pass on",
+                db_text(expected),
+                if on_its_way.is_some() { " (as sent, not reported yet)" } else { "" }
+            );
             self.synced = true;
             return None;
         }
@@ -111,14 +176,30 @@ impl VolumeSync {
             volume: out.clone(),
             before: current.clone(),
             at: now,
+            settled: false,
+            back: false,
         });
         Some(Action::SetDevice(out))
+    }
+
+    /// Equalizer's output now has the volume the app showed there. That is never passed
+    /// on to the device: if the device has moved on meanwhile, the output follows it.
+    fn shown_arrived(&mut self, v: &Volume, device: RealDevice, sink: bool, now: Instant) -> Option<Action> {
+        let RealDevice::Volume(current) = device else { return None };
+        // With a change from the desktop on its way, the device's volume is an old one.
+        let on_its_way = self.sent.iter().any(|s| !s.settled && now.duration_since(s.at) < ECHO_WAIT);
+        if on_its_way || v.close(&current.for_channels(v.channels.len()), ECHO_DB) {
+            self.synced = true;
+            return None;
+        }
+        trace!("volume: the device has moved on to {}", db_text(current));
+        self.show(current.for_channels(2), sink, now)
     }
 
     fn show(&mut self, v: Volume, sink: bool, now: Instant) -> Option<Action> {
         if self
             .shown
-            .as_ref()
+            .back()
             .is_some_and(|(s, at)| s.close(&v, SAME_DB) && now.duration_since(*at) < ECHO_WAIT)
         {
             trace!("volume: not showing {} again, just shown", db_text(&v));
@@ -128,7 +209,7 @@ impl VolumeSync {
             return None;
         }
         trace!("volume: showing {} on Equalizer's device", db_text(&v));
-        self.shown = Some((v.clone(), now));
+        self.shown.push_back((v.clone(), now));
         Some(Action::ShowOnSink(v))
     }
 }
@@ -419,7 +500,10 @@ mod tests {
                     // twice. (Only what the app has been told counts: before the output
                     // reports a change in flight, the app can't know. The soft volumes
                     // that go with every volume make that harmless.)
-                    if self.sync.sink_volume.as_ref() == Some(&v) {
+                    // (A volume set on it earlier and not reported yet means it doesn't
+                    // have the reported one any more: the app's own pending change is the
+                    // last in `shown`, so the one before it counts.)
+                    if self.sync.sink_volume.as_ref() == Some(&v) && self.sync.shown.len() <= 1 {
                         return Err(format!("showed {v:?} on Equalizer's output, which has it already"));
                     }
                     self.sink = v.clone();
@@ -438,40 +522,23 @@ mod tests {
 
         fn handle(&mut self, ev: Ev) -> Result<(), String> {
             let now = self.instant();
-            let in_flight = self.sync.sent.iter().any(|s| now.duration_since(s.at) < ECHO_WAIT);
             let action = match ev {
                 Ev::Device(v, button) => {
                     self.log.push(format!("{:>6} ms  device reports {v:?}", self.now));
-                    if button && in_flight {
-                        // Buttons and the app's own change at the same time: no right answer, and
-                        // a volume near the old one is taken for the old one reported again.
-                        self.taint("a button press while the app's own change was on its way");
+                    let stale = |s: &Sent| now.duration_since(s.at) < STALE_WAIT && s.before.close(&v, STALE_DB);
+                    if button && self.sync.sent.iter().any(stale) {
+                        // Back to the old volume in the very moment the app's change goes
+                        // out: taken for the old one reported once more (find 2).
+                        self.taint("a button press back to the volume before, as the app's change went out");
                     }
                     self.seen = Some(v);
                     self.sync.device_reported(self.seen.as_ref(), true, now)
                 }
                 Ev::Sink(v, origin) => {
                     self.log.push(format!("{:>6} ms  Equalizer's output reports {v:?}", self.now));
-                    if origin == Origin::Show
-                        && (self.sync.shown.as_ref().is_some_and(|(s, _)| !s.close(&v, SAME_DB))
-                            || self
-                                .seen
-                                .as_ref()
-                                .is_some_and(|seen| !v.for_channels(seen.channels.len()).close(seen, SAME_DB)))
-                    {
-                        // The output reports the first of two volumes shown in quick
-                        // succession after the second was shown, which looks like a change.
-                        self.taint("the device reported two volumes closer together than the output takes to report one");
-                    }
                     if let Origin::User(at) = origin {
                         if !self.sync.synced {
                             self.taint("a change before the device's volume was shown on Equalizer's output");
-                        }
-                        if let Some(seen) = &self.seen
-                            && v.for_channels(seen.channels.len()).close(seen, SAME_DB)
-                            && !self.actual.close(seen, SAME_DB)
-                        {
-                            self.taint("a change back to the volume the device last reported, before it reported the one in between");
                         }
                         if self.button_until.is_some_and(|until| at <= until) {
                             self.taint("a change from the desktop while a button press was still being reported");
@@ -528,6 +595,10 @@ mod tests {
                     self.sink_report(v.clone(), self.script.sink_lag, Origin::User(self.now));
                 }
                 Op::Button(v) => {
+                    if self.queue.iter().any(|(.., ev)| matches!(ev, Ev::Sink(_, Origin::User(_)))) {
+                        // The app passes the desktop's change on afterwards, over the button's.
+                        self.taint("a button press before the app had passed on a desktop change");
+                    }
                     self.device_changes(v, false);
                     self.button_until = Some(self.last_report);
                     self.chosen.push(self.actual.clone());
@@ -601,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "found in Part 4 of the 0.0.8 plan, to be sorted in Part 8"]
+    #[ignore = "find 3 of Part 4, left on purpose (the user, 2026-11-18): a button press and a desktop change at the same instant have no right answer; seen only in the model"]
     fn a_button_press_during_a_change_from_the_desktop_can_leave_them_apart() {
         let v = |db: f32, mute| Volume {
             channels: vec![lin(db); 2],
@@ -629,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "found in Part 4 of the 0.0.8 plan, to be sorted in Part 8"]
+    #[ignore = "find 5 of Part 4, left on purpose (the user, 2026-11-18): by design, the output shows the device's volume before passing changes on; about 0.3 s on Bluetooth; seen only in the model"]
     fn a_change_before_the_device_has_reported_is_lost() {
         let v = |db: f32, mute| Volume {
             channels: vec![lin(db); 2],
@@ -671,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "found in Part 4 of the 0.0.8 plan, to be sorted in Part 8"]
+    /// Part 4's find 1, fixed in Part 8: the volume the device is expected to have is the last one sent.
     fn going_back_before_the_device_reports_is_forgotten() {
         let v = |db: f32| Volume {
             channels: vec![lin(db); 2],
@@ -700,7 +771,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "found in Part 4 of the 0.0.8 plan, to be sorted in Part 8"]
+    /// Part 4's find 4. The app still sets the device to the first volume for a moment, but
+    /// the output's next report sets it to the second again, so they end up together.
     fn two_reports_closer_together_than_the_output_takes_to_report_one_undo_the_second() {
         let v = |db: f32| Volume {
             channels: vec![lin(db); 2],
@@ -730,7 +802,44 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "found in Part 4 of the 0.0.8 plan, to be sorted in Part 8"]
+    fn a_button_press_back_to_a_volume_just_passed_through_is_followed() {
+        let v = |db: f32| Volume {
+            channels: vec![lin(db); 2],
+            mute: false,
+        };
+        // The desktop's keys step from -18.1 dB up to -9.9 dB, and then the headphones'
+        // button, which steps the same way, goes back one step, two, or nearly one.
+        for pressed in [-12.4, -15.1, -12.0] {
+            for gap in [110, 150, 450, 1000] {
+                let script = Script {
+                    hardware: Hardware {
+                        channels: 2,
+                        step_db: 0.0,
+                        stale: true,
+                        repeat: true,
+                    },
+                    device: v(-18.1),
+                    sink: v(-18.1),
+                    sink_first: false,
+                    first_gap: 0,
+                    lags: vec![8],
+                    sink_lag: 0,
+                    ops: vec![
+                        (1000, Op::User(v(-15.1))),
+                        (200, Op::User(v(-12.4))),
+                        (200, Op::User(v(-9.9))),
+                        (gap, Op::Button(v(pressed))),
+                    ],
+                    strict: true,
+                };
+                if let Err(e) = Sim::new(&script).run() {
+                    panic!("{pressed} dB, {gap} ms after the last key: {e}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_button_press_just_after_a_change_is_taken_for_its_echo() {
         let v = |db: f32| Volume {
             channels: vec![lin(db); 2],

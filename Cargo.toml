@@ -16,7 +16,7 @@ pipewire = "0.10.1"
 pw_sys = { version = "0.10.1", package = "pipewire-sys" }
 rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 glib-unix = "0.22.8"
 
 [profile.release]

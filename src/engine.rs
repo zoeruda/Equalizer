@@ -3,10 +3,12 @@
 //! settings and reads the meters.
 use pipewire as pw;
 use pw::metadata::{Metadata, MetadataListener};
-use pw::node::Node;
+use pw::node::{Node, NodeChangeMask, NodeState};
 use pw::properties::properties;
 use pw::registry::GlobalObject;
 use pw::spa;
+use pw::spa::node::command::{NodeCommand, NodeCommandId};
+use pw::spa::param::ParamInfoFlags;
 use pw::spa::pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray, deserialize::PodDeserializer, serialize::PodSerializer};
 use pw::spa::utils::dict::DictRef;
 use std::cell::{Cell, RefCell};
@@ -78,6 +80,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const DRAIN_SETTLE: Duration = Duration::from_millis(500);
 /// How often a draining output is checked, to notice that one of those times has passed.
 const DRAIN_TICK: Duration = Duration::from_millis(100);
+/// How long a chain's stream may be running without an audio format before it's
+/// suspended, to have PipeWire set it up again.
+const UNSTICK_WAIT: Duration = Duration::from_millis(300);
+/// How many times in a row that's tried.
+const UNSTICK_TRIES: u32 = 5;
 
 pub enum Cmd {
     Enable {
@@ -111,6 +118,10 @@ pub enum Event {
     /// The person chose a different default device in system settings.
     TurnedOffExternally(Direction),
     Error(String),
+    /// PipeWire went away (it was restarted or stopped) and the connection to it broke.
+    /// The engine doesn't reconnect: sent once, and again for each attempt to turn a
+    /// chain on afterwards.
+    Disconnected,
 }
 
 pub struct Handle {
@@ -259,7 +270,10 @@ struct NodeInfo {
     description: String,
     class: String,
     serial: String,
-    dont_fallback: bool,
+    /// Whether the stream asked not to be sent anywhere else (`node.dont-fallback`). The
+    /// registry doesn't announce that property, so the flag is set from the node's full
+    /// properties by `watch_stream`; it's shared so that doesn't need `Inner`.
+    dont_fallback: Rc<Cell<bool>>,
     /// The device it belongs to, such as a sound card or Bluetooth headphones.
     device: Option<u32>,
 }
@@ -355,9 +369,13 @@ const ECHO_DB: f32 = 0.75;
 /// How long a volume sent to the real device is waited for.
 const ECHO_WAIT: Duration = Duration::from_millis(1500);
 /// How long after a volume is sent to the real device it may still report the volume it
-/// had before. Bluetooth headphones do, a few milliseconds after the change, and then
-/// confirm the new one a quarter of a second later.
-const STALE_WAIT: Duration = Duration::from_millis(500);
+/// had before. Bluetooth headphones do, within 11 ms of the change on real ones. Kept
+/// short because the desktop and the headphones step by the same amounts: a button press
+/// right after the volume keys often goes back to exactly the volume before.
+const STALE_WAIT: Duration = Duration::from_millis(100);
+/// How close a report must be to the volume the device had before to count as that volume
+/// reported once more. As tight as `SAME_DB`: a stale report is the old volume exactly.
+const STALE_DB: f32 = SAME_DB;
 
 /// A volume as PipeWire's Props carry it: a linear gain per channel, and mute.
 #[derive(Clone, Debug, PartialEq)]
@@ -512,14 +530,44 @@ struct Sent {
     /// The device's volume before, which it may still report for a moment.
     before: Volume,
     at: Instant,
+    /// Whether this volume has stopped being the one the device is expected to have: it
+    /// has reported it back, or it has reported another change since. (It still counts as
+    /// an echo for a while after that, and so does the volume before it: the device may
+    /// report the old volume once more *after* the new one, so a report doesn't end that.)
+    settled: bool,
+    /// Whether the device has reported it.
+    back: bool,
 }
 
 /// Whether a volume the real device reports is only the result of volumes sent to it:
 /// one of them coming back, perhaps rounded to the device's steps, or the volume it had
 /// before, reported once more just after.
+#[cfg(test)]
 fn is_echo(sent: &VecDeque<Sent>, v: &Volume, now: Instant) -> bool {
-    sent.iter()
-        .any(|s| s.volume.close(v, ECHO_DB) || (now.duration_since(s.at) < STALE_WAIT && s.before.close(v, ECHO_DB)))
+    echo_kind(sent, v, now).is_some()
+}
+
+/// Which kind of echo a reported volume is, if it is one. A volume sent coming back wins
+/// over the volume before, so the trace shows the second only when nothing else explains it.
+fn echo_kind(sent: &VecDeque<Sent>, v: &Volume, now: Instant) -> Option<Echo> {
+    if sent.iter().any(|s| s.volume.close(v, ECHO_DB)) {
+        Some(Echo::Sent)
+    } else if sent
+        .iter()
+        .any(|s| now.duration_since(s.at) < STALE_WAIT && s.before.close(v, STALE_DB))
+    {
+        Some(Echo::Before)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Echo {
+    /// A volume sent to the device coming back, perhaps rounded to its steps.
+    Sent,
+    /// The volume the device had before, reported once more.
+    Before,
 }
 
 struct Route {
@@ -531,6 +579,9 @@ struct Route {
 /// changes the sound: Equalizer's device shows it and passes changes on to it.
 struct RealOutput {
     name: String,
+    /// The node this follows. A device that goes and comes back under its name is a new
+    /// node, and this one is dead.
+    id: u32,
     /// Declared before the proxies they listen to, so they're dropped first.
     _node_listener: pw::node::NodeListener,
     _device_listener: Option<pw::device::DeviceListener>,
@@ -566,6 +617,18 @@ fn monitor_gain(volume: Option<&Volume>, monitor: Option<&Volume>, follows_volum
     Some(m)
 }
 
+/// Whether the real output being followed is the one wanted, on the node it has now. The
+/// name alone isn't enough: WirePlumber restarting, or a card changing profile, removes a
+/// device and brings it back under the same name as a new node. What's sent to the old
+/// one gets "unknown resource" and is lost, so the volume stops reaching the device.
+fn real_output_is_current(bound: Option<(&str, u32)>, want: Option<&str>, id_now: Option<u32>) -> bool {
+    match (bound, want) {
+        (None, None) => true,
+        (Some((name, id)), Some(want)) => name == want && id_now == Some(id),
+        _ => false,
+    }
+}
+
 /// The default device to hand back, if it still exists. WirePlumber remembers every
 /// default it's been given, including our virtual device. So if it were given a device
 /// that's gone, it could fall back on ours, and streams would have no reason to leave.
@@ -583,12 +646,24 @@ fn streams_to_move(links: &HashMap<u32, LinkEnds>, nodes: &HashMap<u32, NodeInfo
         .filter(|id| {
             nodes
                 .get(id)
-                .is_some_and(|n| n.class.starts_with("Stream/Output") && !n.dont_fallback)
+                .is_some_and(|n| n.class.starts_with("Stream/Output") && !n.dont_fallback.get())
         })
         .collect();
     streams.sort_unstable();
     streams.dedup();
     streams
+}
+
+/// Whether anything is still linked into the device that has to leave before it can be
+/// removed. A stream that asked for no fallback stays, and goes with the device, as it
+/// asked: waiting for it would only run out the clock.
+fn must_leave(links: &HashMap<u32, LinkEnds>, nodes: &HashMap<u32, NodeInfo>, device: u32) -> bool {
+    links.values().any(|link| {
+        link.input == device
+            && !nodes
+                .get(&link.output)
+                .is_some_and(|n| n.class.starts_with("Stream/Output") && n.dont_fallback.get())
+    })
 }
 
 /// Watches a filter-chain module, which removes itself when its device is destroyed by
@@ -731,6 +806,10 @@ struct Inner {
     /// Watches every microphone's full properties, by node id: the registry doesn't
     /// pass on the one that marks WirePlumber's stand-in.
     source_props: HashMap<u32, (pw::node::NodeListener, Node)>,
+    /// The same for every stream playing, for `node.dont-fallback`, by node id.
+    stream_props: HashMap<u32, (pw::node::NodeListener, Node)>,
+    /// The chains' own streams to the real devices, by node id (see `StreamState`).
+    chain_streams: HashMap<u32, (pw::node::NodeListener, Node, Rc<RefCell<StreamState>>)>,
     /// WirePlumber's stand-in microphones for Bluetooth headphones playing music, by
     /// node id (`bluez5.loopback`). They only work once an app records and the
     /// headphones switch to their headset profile. Headphones that don't need to
@@ -760,6 +839,11 @@ fn device_class(dir: usize, class: &str) -> bool {
 
 const fn libc_enoent() -> i32 {
     2
+}
+
+/// The error PipeWire's core reports when its server has gone away.
+const fn libc_epipe() -> i32 {
+    32
 }
 
 fn name_json(v: Option<&str>) -> Option<String> {
@@ -921,15 +1005,40 @@ impl Inner {
             return false;
         }
         trace!("device: {} should use {hw}: {rule}", own(dir));
-        let stream = if dir == 0 { OUT_STREAM } else { MIC_STREAM };
-        let serial = self.nodes.values().find(|n| n.name == hw).map(|n| n.serial.clone());
-        if let (Some(id), Some(serial), Some(m)) = (self.node_id(stream), serial, &self.metadata) {
-            m.set_property(id, "target.object", Some("Spa:Id"), Some(&serial));
+        if self.point_at(dir, &hw) {
             trace!("device: {} moves from {:?} to {hw}", own(dir), self.chains[dir].hw);
             self.chains[dir].hw = Some(hw);
             return true;
         }
         false
+    }
+
+    /// Tells WirePlumber, through the default metadata, that this chain's output goes to the
+    /// device called `hw`. Returns whether it could: the device and the stream must be listed.
+    fn point_at(&self, dir: usize, hw: &str) -> bool {
+        let stream = if dir == 0 { OUT_STREAM } else { MIC_STREAM };
+        let serial = self.nodes.values().find(|n| n.name == hw).map(|n| n.serial.as_str());
+        let (Some(id), Some(serial), Some(m)) = (self.node_id(stream), serial, &self.metadata) else {
+            return false;
+        };
+        m.set_property(id, "target.object", Some("Spa:Id"), Some(serial));
+        true
+    }
+
+    /// Says again where a running chain's output goes, when what WirePlumber was told
+    /// is gone. A restart of WirePlumber forgets its metadata and removes the devices it
+    /// owns, which come back under the same name with a new node and serial. The chain
+    /// still names that device, so `retarget` finds nothing to change, and the stream is
+    /// left with a target that no longer exists.
+    fn reassert_target(&self, dir: usize, why: &str) {
+        let chain = &self.chains[dir];
+        if !chain.on() || chain.draining.is_some() {
+            return;
+        }
+        let Some(hw) = chain.hw.as_deref() else { return };
+        if self.point_at(dir, hw) {
+            trace!("device: {} told again to use {hw}: {why}", own(dir));
+        }
     }
 
     fn unload(&mut self, dir: usize) {
@@ -968,8 +1077,7 @@ impl Inner {
 
     /// Whether any streams are still playing into this chain's virtual device.
     fn in_use(&self, dir: usize) -> bool {
-        self.node_id(own(dir))
-            .is_some_and(|id| self.links.values().any(|link| link.input == id))
+        self.node_id(own(dir)).is_some_and(|id| must_leave(&self.links, &self.nodes, id))
     }
 
     /// Sends the streams on this chain's virtual device to a real one. Handing back the
@@ -989,7 +1097,11 @@ impl Inner {
                 "streams: pinning stream {id} ({}) to {}, which the app thinks {} dont-fallback",
                 self.nodes.get(id).map_or("?", |n| n.name.as_str()),
                 destination.unwrap_or("?"),
-                if self.nodes.get(id).is_some_and(|n| n.dont_fallback) { "has" } else { "doesn't have" }
+                if self.nodes.get(id).is_some_and(|n| n.dont_fallback.get()) {
+                    "has"
+                } else {
+                    "doesn't have"
+                }
             );
             metadata.set_property(*id, "target.object", Some("Spa:Id"), Some(serial));
         }
@@ -1039,6 +1151,94 @@ impl Inner {
     }
 }
 
+/// Keeps `flag` the same as the stream's `node.dont-fallback`, from the properties it
+/// reports when it's bound and whenever they change.
+fn watch_stream(node: &Node, flag: Rc<Cell<bool>>) -> pw::node::NodeListener {
+    node.add_listener_local()
+        .info(move |info| {
+            // Only an event that carries the properties says anything about them.
+            if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
+                return;
+            }
+            if let Some(props) = info.props() {
+                flag.set(matches!(props.get("node.dont-fallback"), Some("true" | "1")));
+            }
+        })
+        .register()
+}
+
+/// What's known of one of the chains' own streams to a real device. When WirePlumber
+/// restarts, such a stream can come back linked and running but with no audio format of
+/// its own: it then plays (or records) silence, the graph looking as it should, until
+/// the chain is loaded again. Seen on real hardware and with `tests/restart.py`, on
+/// about one restart in five (PipeWire 1.6.11, WirePlumber 0.5.19).
+#[derive(Default)]
+struct StreamState {
+    running: bool,
+    format: bool,
+    /// A look at it is booked.
+    booked: bool,
+    /// How many times in a row it's been suspended.
+    tries: u32,
+}
+
+impl StreamState {
+    fn stuck(&self) -> bool {
+        self.running && !self.format
+    }
+
+    /// Takes in what the node said about itself, `None` for what it didn't mention.
+    /// True when a look at it is to be booked: a healthy stream can be running for an
+    /// instant before its format is heard of, so nothing is done at once.
+    fn note(&mut self, running: Option<bool>, format: Option<bool>) -> bool {
+        self.running = running.unwrap_or(self.running);
+        self.format = format.unwrap_or(self.format);
+        if self.running && self.format {
+            self.tries = 0;
+        }
+        let book = self.stuck() && !self.booked && self.tries < UNSTICK_TRIES;
+        self.booked |= book;
+        book
+    }
+
+    /// The booked look. True when the stream is still stuck and is to be suspended, and
+    /// then another look is booked, in case that changed nothing.
+    fn look(&mut self) -> bool {
+        self.booked = self.stuck() && self.tries < UNSTICK_TRIES;
+        self.tries += u32::from(self.booked);
+        self.booked
+    }
+}
+
+/// Sends a stream's id back to the loop after `UNSTICK_WAIT`.
+fn wake_later(wake: pw::channel::Sender<u32>, id: u32) {
+    std::thread::spawn(move || {
+        std::thread::sleep(UNSTICK_WAIT);
+        let _ = wake.send(id);
+    });
+}
+
+/// Keeps a chain stream's `StreamState` up to date, and has it looked at when it seems
+/// stuck. A node has a format when its Format param can be read.
+fn watch_chain_stream(node: &Node, id: u32, state: Rc<RefCell<StreamState>>, wake: pw::channel::Sender<u32>) -> pw::node::NodeListener {
+    node.add_listener_local()
+        .info(move |info| {
+            let changed = info.change_mask();
+            let running = changed
+                .contains(NodeChangeMask::STATE)
+                .then(|| matches!(info.state(), NodeState::Running));
+            let format = changed.contains(NodeChangeMask::PARAMS).then(|| {
+                info.params()
+                    .iter()
+                    .any(|p| p.id() == spa::param::ParamType::Format && p.flags().contains(ParamInfoFlags::READ))
+            });
+            if state.borrow_mut().note(running, format) {
+                wake_later(wake.clone(), id);
+            }
+        })
+        .register()
+}
+
 fn set_params(node: &Node, params: &[(String, f32)]) {
     let mut values = Vec::with_capacity(params.len() * 2);
     for (k, v) in params {
@@ -1084,15 +1284,18 @@ fn track_real_output(inner: &Rc<RefCell<Inner>>) {
     } else {
         None
     };
-    if s.real.as_ref().map(|r| r.name.clone()) == want {
+    let id_now = want.as_deref().and_then(|n| s.node_id(n));
+    let bound = s.real.as_ref().map(|r| (r.name.as_str(), r.id));
+    if real_output_is_current(bound, want.as_deref(), id_now) {
         return;
     }
     s.real = None;
-    // A different device: Equalizer's output shows its volume before passing changes on.
+    // A different device, or the same one come back as a new node: Equalizer's output
+    // shows its volume before passing changes on.
     s.sync.device_changed();
     s.update_post_gain();
     let Some(name) = want else { return };
-    let Some(id) = s.node_id(&name) else { return };
+    let Some(id) = id_now else { return };
     let node: Node = match bind_global(&s.registry, id, pw::types::ObjectType::Node) {
         Ok(n) => n,
         Err(e) => {
@@ -1143,8 +1346,10 @@ fn track_real_output(inner: &Rc<RefCell<Inner>>) {
         })
         .register();
     node.subscribe_params(&[spa::param::ParamType::Props]);
+    trace!("volume: following {name}'s node {id}");
     s.real = Some(RealOutput {
         name,
+        id,
         _node_listener: listener,
         _device_listener: None,
         node,
@@ -1339,6 +1544,11 @@ fn run(
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
+    trace!(
+        "app: version {}, the volume before counts within {STALE_DB} dB for {} ms",
+        env!("CARGO_PKG_VERSION"),
+        STALE_WAIT.as_millis()
+    );
     let inner = Rc::new(RefCell::new(Inner {
         nodes: HashMap::new(),
         links: HashMap::new(),
@@ -1353,6 +1563,8 @@ fn run(
         last_devices: (vec![], vec![], [false; 2]),
         device_of: HashMap::new(),
         source_props: HashMap::new(),
+        stream_props: HashMap::new(),
+        chain_streams: HashMap::new(),
         stand_ins: HashSet::new(),
         registry: registry.clone(),
         post: post.clone(),
@@ -1425,13 +1637,16 @@ fn run(
 
     // Removes any draining output that's ready, and ends the loop once quitting is done.
     let quit_seq: Rc<Cell<Option<i32>>> = Rc::new(Cell::new(None));
+    // Set when the connection to PipeWire breaks: nothing is answered after that.
+    let lost = Rc::new(Cell::new(false));
     let finish_drains: Rc<dyn Fn()> = {
-        let (inner, core, ml, rebuild, quit_seq) = (
+        let (inner, core, ml, rebuild, quit_seq, lost) = (
             inner.clone(),
             core.clone(),
             mainloop.clone(),
             rebuild_meters.clone(),
             quit_seq.clone(),
+            lost.clone(),
         );
         Rc::new(move || {
             let mut s = inner.borrow_mut();
@@ -1450,6 +1665,11 @@ fn run(
             let quit = s.quitting && !s.chains.iter().any(Chain::on) && quit_seq.get().is_none();
             drop(s);
             if quit {
+                if lost.get() {
+                    // There's no server to answer, so waiting for it would never end.
+                    ml.quit();
+                    return;
+                }
                 // Let the server see these changes before the connection closes.
                 match core.sync(0) {
                     Ok(seq) => quit_seq.set(Some(seq.seq())),
@@ -1473,6 +1693,27 @@ fn run(
                     sources: current.1,
                     headset_switch: current.2,
                 });
+            }
+        })
+    };
+
+    // Looks again at a chain's stream a moment after it seemed stuck, and sets it up
+    // again if it still is: a suspend drops its links' buffers, and PipeWire negotiates
+    // the format afresh as it starts it again.
+    let (stuck_tx, stuck_rx) = pw::channel::channel::<u32>();
+    let _stuck = {
+        let (inner, again) = (inner.clone(), stuck_tx.clone());
+        stuck_rx.attach(mainloop.loop_(), move |id| {
+            let s = inner.borrow();
+            let Some((_, node, state)) = s.chain_streams.get(&id) else { return };
+            let suspend = state.borrow_mut().look();
+            if suspend {
+                trace!(
+                    "stream: {} is running without an audio format, suspending it so it's set up again",
+                    s.nodes.get(&id).map_or("?", |n| n.name.as_str())
+                );
+                node.send_command(&NodeCommand::new(NodeCommandId::SUSPEND));
+                wake_later(again.clone(), id);
             }
         })
     };
@@ -1510,10 +1751,11 @@ fn run(
                                 .to_string(),
                             class: props.get("media.class").unwrap_or_default().to_string(),
                             serial: props.get("object.serial").unwrap_or_default().to_string(),
-                            dont_fallback: matches!(props.get("node.dont-fallback"), Some("true" | "1")),
+                            dont_fallback: Rc::new(Cell::new(matches!(props.get("node.dont-fallback"), Some("true" | "1")))),
                             device: props.get("device.id").and_then(|v| v.parse().ok()),
                             name: name.clone(),
                         };
+                        let no_fallback = info.dont_fallback.clone();
                         let dir = if name == SINK_NAME {
                             Some(0)
                         } else if name == SOURCE_NAME {
@@ -1541,6 +1783,10 @@ fn run(
                                         && s.resolve_hw(d).as_deref() == Some(name.as_str())
                                     {
                                         moved |= s.retarget(d);
+                                    }
+                                    // The device the chain already names, back under a new node.
+                                    if s.chains[d].hw.as_deref() == Some(name.as_str()) {
+                                        s.reassert_target(d, "its device came back as a new node");
                                     }
                                 }
                             }
@@ -1581,6 +1827,27 @@ fn run(
                                     inner.borrow_mut().source_props.insert(g.id, (listener, node));
                                 }
                                 Err(e) => eprintln!("equalizer: can't read the properties of a microphone: {e}"),
+                            }
+                        }
+                        if name == OUT_STREAM || name == MIC_STREAM {
+                            match reg.bind::<Node, _>(g) {
+                                Ok(node) => {
+                                    let state = Rc::new(RefCell::new(StreamState::default()));
+                                    let listener = watch_chain_stream(&node, g.id, state.clone(), stuck_tx.clone());
+                                    inner.borrow_mut().chain_streams.insert(g.id, (listener, node, state));
+                                }
+                                Err(e) => eprintln!("equalizer: can't watch {name}: {e}"),
+                            }
+                        }
+                        // Whether a stream asked for no fallback is only in its full
+                        // properties too, and it decides if it may be moved.
+                        if dir.is_none() && props.get("media.class").unwrap_or_default().starts_with("Stream/Output") {
+                            match reg.bind::<Node, _>(g) {
+                                Ok(node) => {
+                                    let listener = watch_stream(&node, no_fallback);
+                                    inner.borrow_mut().stream_props.insert(g.id, (listener, node));
+                                }
+                                Err(e) => eprintln!("equalizer: can't read the properties of a stream: {e}"),
                             }
                         }
                         if let Some(d) = dir {
@@ -1689,8 +1956,20 @@ fn run(
                             })
                             .register();
                         let mut s = inner.borrow_mut();
+                        // A second one means the session manager started again: what it was
+                        // told through the first (the chains' targets, pinned streams) is gone.
+                        trace!(
+                            "metadata: the default metadata is bound{}",
+                            if s.metadata.is_some() { " again" } else { "" }
+                        );
+                        let again = s.metadata.is_some();
                         s.metadata = Some(meta);
                         s.meta_listener = Some(listener);
+                        if again {
+                            for d in 0..2 {
+                                s.reassert_target(d, "the metadata was bound again");
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1703,6 +1982,8 @@ fn run(
                 {
                     let mut s = inner_rm.borrow_mut();
                     s.source_props.remove(&id);
+                    s.stream_props.remove(&id);
+                    s.chain_streams.remove(&id);
                     s.stand_ins.remove(&id);
                 }
                 let removed = inner_rm.borrow_mut().nodes.remove(&id);
@@ -1733,7 +2014,14 @@ fn run(
     let phase = Rc::new(Cell::new(0));
     let first = core.sync(0)?;
     let _core_listener = {
-        let (ml, core2, phase, events, quit_seq) = (mainloop.clone(), core.clone(), phase.clone(), events.clone(), quit_seq.clone());
+        let (ml, core2, phase, events, quit_seq, lost) = (
+            mainloop.clone(),
+            core.clone(),
+            phase.clone(),
+            events.clone(),
+            quit_seq.clone(),
+            lost.clone(),
+        );
         let second: Rc<Cell<Option<spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
         core.add_listener_local()
             .done(move |id, seq| {
@@ -1752,6 +2040,15 @@ fn run(
             })
             .error(move |id, _seq, res, message| {
                 if id != pw::core::PW_ID_CORE {
+                    return;
+                }
+                trace!("core: error {res}: {message}");
+                if res == -libc_epipe() {
+                    // PipeWire was restarted or stopped. The chains' modules go with the
+                    // connection, and the window is told once.
+                    if !lost.replace(true) {
+                        let _ = events.try_send(Event::Disconnected);
+                    }
                     return;
                 }
                 // -ENOENT only means an object we referred to has already gone, such
@@ -1789,13 +2086,14 @@ fn run(
     };
 
     let _receiver = {
-        let (inner, context, rebuild, events, finish, send) = (
+        let (inner, context, rebuild, events, finish, send, lost) = (
             inner.clone(),
             context.clone(),
             rebuild_meters.clone(),
             events.clone(),
             finish_drains.clone(),
             send_devices.clone(),
+            lost.clone(),
         );
         let handle = move |cmd| match cmd {
             Cmd::Enable {
@@ -1805,6 +2103,12 @@ fn run(
                 plugin,
             } => {
                 let d = dir as usize;
+                if lost.get() {
+                    trace!("module: not loading the {} chain, PipeWire is gone", own(d));
+                    let _ = events.try_send(Event::Disconnected);
+                    let _ = events.try_send(Event::TurnedOffExternally(dir));
+                    return;
+                }
                 let mut s = inner.borrow_mut();
                 let configured = s.configured[d].clone().filter(|n| n != own(d));
                 // The module removed itself, and the Disable that follows hasn't come yet.
@@ -1931,6 +2235,54 @@ fn run(
 mod tests {
     use super::*;
     use crate::model::{Sound, plugin_controls};
+
+    #[test]
+    fn a_stream_running_without_a_format_is_suspended_and_a_healthy_one_left_alone() {
+        let mut s = StreamState::default();
+        // Starting up as a healthy stream does.
+        assert!(!s.note(Some(false), Some(false)));
+        assert!(!s.note(None, Some(true)));
+        assert!(!s.note(Some(true), None));
+        assert!(!s.look());
+
+        // Running before its format is heard of: looked at later, and by then fine.
+        let mut s = StreamState::default();
+        assert!(s.note(Some(true), Some(false)));
+        assert!(!s.note(None, None), "one look at a time");
+        assert!(!s.note(None, Some(true)));
+        assert!(!s.look());
+
+        // Stuck: suspended, again if that changes nothing, and not for ever.
+        assert!(s.note(None, Some(false)));
+        for _ in 0..UNSTICK_TRIES {
+            assert!(s.look());
+        }
+        assert!(!s.look());
+        assert!(!s.note(Some(true), Some(false)), "given up");
+
+        // Healthy once more, it gets all its tries back.
+        assert!(!s.note(None, Some(true)));
+        assert!(s.note(None, Some(false)));
+        assert!(s.look());
+    }
+
+    #[test]
+    fn a_device_that_comes_back_under_its_name_is_a_new_node_to_follow() {
+        // Nothing wanted, nothing followed: nothing to do.
+        assert!(real_output_is_current(None, None, None));
+        // Something wanted and nothing followed yet, or the other way round.
+        assert!(!real_output_is_current(None, Some("hw"), Some(7)));
+        assert!(!real_output_is_current(Some(("hw", 7)), None, None));
+        // The same node.
+        assert!(real_output_is_current(Some(("hw", 7)), Some("hw"), Some(7)));
+        // WirePlumber restarting, or a card changing profile, makes a new node with the
+        // same name: the old one is dead, and what's sent to it is lost (the sweep's I4).
+        assert!(!real_output_is_current(Some(("hw", 7)), Some("hw"), Some(9)));
+        // While it's gone, nothing is followed, so nothing is sent into the gap.
+        assert!(!real_output_is_current(Some(("hw", 7)), Some("hw"), None));
+        // Another device.
+        assert!(!real_output_is_current(Some(("hw", 7)), Some("other"), Some(7)));
+    }
 
     #[test]
     fn pipewire_before_1_6_7_is_too_old_for_the_volume_after_the_effects() {
@@ -2094,6 +2446,8 @@ mod tests {
             volume: vol(&[0.343, 0.343], false),
             before: vol(&[0.279, 0.279], false),
             at: start,
+            settled: false,
+            back: false,
         }]);
         let soon = start + Duration::from_millis(10);
         // The change coming back, rounded to the headphones' steps.
@@ -2296,7 +2650,7 @@ mod tests {
             description: String::new(),
             class: class.to_string(),
             serial: String::new(),
-            dont_fallback,
+            dont_fallback: Rc::new(Cell::new(dont_fallback)),
             device: None,
         };
         let nodes = HashMap::from([
@@ -2318,6 +2672,43 @@ mod tests {
             (16, link(1, 99)), // A node that's already gone.
         ]);
         assert_eq!(streams_to_move(&links, &nodes, 1), vec![2, 3]);
+    }
+
+    /// The registry doesn't announce `node.dont-fallback`: it arrives later, from the
+    /// node's own properties, into the flag the registry's copy of the node shares.
+    #[test]
+    fn a_stream_that_says_so_later_is_left_alone_and_not_waited_for() {
+        let flag = Rc::new(Cell::new(false));
+        let stream = NodeInfo {
+            name: String::new(),
+            description: String::new(),
+            class: "Stream/Output/Audio".to_string(),
+            serial: String::new(),
+            dont_fallback: flag.clone(),
+            device: None,
+        };
+        let nodes = HashMap::from([(2, stream)]);
+        let links = HashMap::from([(10, LinkEnds { input: 1, output: 2 })]);
+        assert_eq!(streams_to_move(&links, &nodes, 1), vec![2]);
+        assert!(must_leave(&links, &nodes, 1));
+        flag.set(true);
+        assert!(streams_to_move(&links, &nodes, 1).is_empty());
+        assert!(!must_leave(&links, &nodes, 1), "it stays and goes with the device");
+        // Anything else linked in still has to leave, even if only a no-fallback stream is too.
+        let mut nodes = nodes;
+        nodes.insert(
+            3,
+            NodeInfo {
+                name: String::new(),
+                description: String::new(),
+                class: "Stream/Output/Audio".to_string(),
+                serial: String::new(),
+                dont_fallback: Rc::new(Cell::new(false)),
+                device: None,
+            },
+        );
+        let links = HashMap::from([(10, LinkEnds { input: 1, output: 2 }), (11, LinkEnds { input: 1, output: 3 })]);
+        assert!(must_leave(&links, &nodes, 1));
     }
 }
 

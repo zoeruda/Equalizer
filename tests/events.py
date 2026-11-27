@@ -37,6 +37,12 @@ KNOWN_LINES = [
 ]
 # Found by this test, listed at the end and in the report instead of failing every step:
 # PipeWire's complaint about a message to a resource that's gone, other than the known op 7.
+# Part 8 of the 0.0.8 plan explains them: when a device is removed while the Output is on,
+# WirePlumber removes the old post meter's node with it, and the app's rebuild of the
+# meters tears that stream down, which makes libpipewire send its last parameter updates
+# (op:2, op:3) and then its destroy (op:7) to the resource that's gone. They come in one
+# burst, right after the trace line "meters: rebuilt", and are harmless. Kept as "noted"
+# rather than known, so a new kind of message to a removed resource still shows.
 NOTED_LINES = [r"unknown resource \d+ op:(?!7\b)\d+"]
 
 ap = argparse.ArgumentParser()
@@ -67,6 +73,8 @@ class World:
         self.mods = {}
         self.player = None
         self.player_target = None
+        self.pinned = None  # a player that asked for the app's device and for no fallback
+        self.pinned_leaks = set()  # the devices it was seen linked to, other than that one
         self.active = True
         self.default_before = default_sink()
         self.source_before = run("pactl", "get-default-source") or None
@@ -153,6 +161,8 @@ class World:
         return code
 
     def teardown(self):
+        if self.pinned:
+            self.pinned.terminate()
         if self.player:
             self.player.terminate()
         self.exit_code = None
@@ -329,6 +339,34 @@ def ev_player():
     return "player started on the default device"
 
 
+def ev_pinned_player():
+    """A player that asked for the app's device and for no fallback (as the tests' own
+    players do). When Active goes off it may stop, but it must never be sent to another
+    device: rule 9."""
+    if w.pinned:
+        w.pinned.terminate()
+        w.pinned = None
+        return "pinned player stopped"
+    if not node_exists(SINK):
+        return None
+    path = tones.tone(330, -45, 300, name="pinned.wav")
+    w.pinned = subprocess.Popen(["pw-play", f"--target={SINK}", "-P", NO_FALLBACK, path], stderr=subprocess.DEVNULL)
+    return f"pinned player started on {SINK} (dont-fallback)"
+
+
+def settle(seconds=1.0):
+    """Waits after an event, and meanwhile watches where a pinned player is linked."""
+    end = time.monotonic() + seconds
+    while True:
+        if w.pinned and w.pinned.poll() is None:
+            nodes, links, clients = graph()
+            ids = {i for i, p in nodes.items() if clients.get(p.get("client.id")) == str(w.pinned.pid)}
+            w.pinned_leaks |= {nodes[i].get("node.name") for o, i in links if o in ids and i in nodes} - {SINK}
+        if time.monotonic() >= end:
+            return
+        time.sleep(0.1)
+
+
 def ev_quit():
     on = w.active_now()
     code = w.quit_and_restart()
@@ -394,6 +432,9 @@ def settle_after_restart():
 def ev_restart_wireplumber():
     """WirePlumber restarted: the session manager forgets the links and the defaults it
     holds, and works them out again."""
+    if w.pinned:
+        w.pinned.terminate()
+        w.pinned = None
     if w.player:  # nothing may be playing while the routing is up in the air
         w.player.terminate()
         w.player = None
@@ -407,6 +448,9 @@ def ev_restart_wireplumber():
 def ev_restart_pipewire():
     """PipeWire, its Pulse layer and WirePlumber restarted: every device the test made, and
     the app's own, is gone and has to be made again."""
+    if w.pinned:
+        w.pinned.terminate()
+        w.pinned = None
     if w.player:
         w.player.terminate()
         w.player = None
@@ -461,6 +505,7 @@ EVENTS = [
     (3, ev_active),
     (2, ev_tab),
     (2, ev_player),
+    (2, ev_pinned_player),
 ]
 
 
@@ -602,6 +647,13 @@ def rules(step, check_sound, check_delay=False):
             ids = [i for i, p in nodes.items() if p.get("node.name") == "pw-play" and p.get("media.class") == "Stream/Output/Audio"]
             if not ids or not any(o in ids for o, _ in links):
                 bad("7. the player isn't linked to any device")
+
+    # 9. A stream that asked for no fallback is never sent to a device it didn't ask for.
+    # (It may stop when its device goes: that's what it asked for.) The links are sampled
+    # during the settling second after each step (`settle`), as the player is gone soon.
+    if w.pinned_leaks:
+        bad(f"9. a player that asked for {SINK} with no fallback was linked to {', '.join(sorted(w.pinned_leaks))}")
+        w.pinned_leaks = set()
     return problems
 
 
@@ -627,7 +679,7 @@ try:
         say = ev()
         if say is None:
             say = "(nothing to do)"
-        time.sleep(1.0)
+        settle(1.0)
         problems = rules(k, check_sound=not args.no_sound and k % 2 == 0, check_delay=bool(args.delay_every) and k % args.delay_every == 0)
         # The model follows the window after the desktop's own default change.
         w.active = w.active_now()
@@ -638,8 +690,9 @@ try:
                 print(f"       {p}")
             failed = k
             w.log.flush()
-            tail = open(w.stderr_path, errors="replace").read().splitlines()[-30:]
-            report["app_log_tail"] = tail
+            whole = open(w.stderr_path, errors="replace").read().splitlines()
+            tail = whole[-30:]
+            report["app_log_tail"] = whole[-300:]  # the report keeps more than the screen shows
             print("   the app's last lines:")
             for l in tail:
                 print("      " + l)
@@ -651,6 +704,16 @@ finally:
     report["noted"] = w.noted
     if w.noted:
         print(f"noted, not a failure: {len(w.noted)} lines like “{w.noted[0]}”")
+        # With the trace around them, to see what the app was doing when they came.
+        try:
+            report["app_log_with_noted"] = open(w.stderr_path, errors="replace").read().splitlines()[-600:]
+        except OSError:
+            pass
+        # With the trace around them, to see what the app was doing when they came.
+        try:
+            report["app_log_with_noted"] = open(w.stderr_path, errors="replace").read().splitlines()[-600:]
+        except OSError:
+            pass
     stamp = time.strftime("%Y%m%d-%H%M%S")
     # In the home folder, unless EQUALIZER_REPORT_DIR says otherwise (tests/all.py sets it).
     path = os.path.join(os.path.expanduser(os.environ.get("EQUALIZER_REPORT_DIR") or "~"), f"equalizer-events-report-{stamp}.json")

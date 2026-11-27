@@ -2,7 +2,7 @@
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -1460,6 +1460,13 @@ fn in_flatpak() -> bool {
     std::path::Path::new("/.flatpak-info").exists()
 }
 
+/// The version as About shows it, with which build this is: the Flatpak and the others
+/// (`install.sh`, a distribution's package) can be installed side by side, and what a bug
+/// report says it ran should tell them apart.
+fn version_text(version: &str, flatpak: bool) -> String {
+    format!("{version} ({})", if flatpak { "Flatpak" } else { "native" })
+}
+
 /// The arguments of the portal's RequestBackground call, as its `(sa{sv})` signature.
 fn background_request(on: bool, token: &str) -> glib::Variant {
     let options = glib::VariantDict::new(None);
@@ -1584,7 +1591,7 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                 .application_name("Equalizer")
                 .application_icon(APP_ID)
                 .developer_name("Zoe Ronen (zoeruda)")
-                .version(env!("CARGO_PKG_VERSION"))
+                .version(version_text(env!("CARGO_PKG_VERSION"), in_flatpak()))
                 .comments("A clean, simple equalizer for PipeWire, built on the LSP audio plugins.")
                 .website(env!("CARGO_PKG_REPOSITORY"))
                 .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues"))
@@ -1723,18 +1730,30 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
     let device_lists: Rc<RefCell<[Vec<Device>; 2]>> = Rc::new(RefCell::new([vec![], vec![]]));
     let dev_busy = Rc::new(Cell::new(false));
     let dropdowns = [out_dev.clone(), mic_dev.clone()];
+    // Once PipeWire has gone away no device will come back, so the saved device stays in the
+    // picker, as the window shows what's saved. Its description is what was last seen.
+    let disconnected = Rc::new(Cell::new(false));
+    let seen_descriptions: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
     let fill_devices: Rc<dyn Fn()> = {
         let (ctx, lists, busy, dropdowns) = (ctx.clone(), device_lists.clone(), dev_busy.clone(), dropdowns.clone());
+        let (disconnected, seen) = (disconnected.clone(), seen_descriptions.clone());
         Rc::new(move || {
             busy.set(true);
             for (i, dir) in DIRS.iter().enumerate() {
                 let devs = &lists.borrow()[i];
                 let mut names = vec!["System default".to_string()];
                 names.extend(devs.iter().map(|d| d.description.clone()));
+                let wanted = ctx.state.borrow().chain(*dir).device.clone();
+                let mut pos = wanted
+                    .as_ref()
+                    .and_then(|w| devs.iter().position(|d| d.name == *w))
+                    .map_or(0, |p| p + 1);
+                if let (0, true, Some(w)) = (pos, disconnected.get(), &wanted) {
+                    names.push(seen.borrow().get(w).cloned().unwrap_or_else(|| w.clone()));
+                    pos = names.len() - 1;
+                }
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
                 dropdowns[i].set_model(Some(&gtk::StringList::new(&refs)));
-                let wanted = ctx.state.borrow().chain(*dir).device.clone();
-                let pos = wanted.and_then(|w| devs.iter().position(|d| d.name == w)).map_or(0, |p| p + 1);
                 dropdowns[i].set_selected(pos as u32);
             }
             busy.set(false);
@@ -1750,8 +1769,11 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
             let pos = d.selected() as usize;
             let device = if pos == 0 {
                 None
+            } else if let Some(x) = lists.borrow()[dir as usize].get(pos - 1) {
+                Some(x.name.clone())
             } else {
-                lists.borrow()[dir as usize].get(pos - 1).map(|x| x.name.clone())
+                // The saved device kept in the list after PipeWire went away: not a choice.
+                return;
             };
             ctx2.state.borrow_mut().chain_mut(dir).device = device.clone();
             ctx2.mark_changed();
@@ -1815,6 +1837,7 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
             toasts.clone(),
             mic_note.clone(),
         );
+        let (disconnected, seen) = (disconnected.clone(), seen_descriptions.clone());
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
@@ -1823,12 +1846,22 @@ pub fn build(app: &adw::Application, start_hidden: bool) {
                         sources,
                         headset_switch,
                     } => {
+                        seen.borrow_mut()
+                            .extend(sinks.iter().chain(&sources).map(|d| (d.name.clone(), d.description.clone())));
                         *lists.borrow_mut() = [sinks, sources];
                         fill();
                         note.set_visible(headset_switch[Direction::Mic as usize]);
                     }
                     Event::TurnedOffExternally(dir) => ctx2.set_enabled(dir, false),
                     Event::Error(message) => toasts2.add_toast(plain_toast(&message)),
+                    Event::Disconnected => {
+                        // Also sent when a chain is turned on afterwards, which says it again.
+                        disconnected.set(true);
+                        fill();
+                        toasts2.add_toast(plain_toast(
+                            "PipeWire stopped, and Equalizer lost its connection to it. Restart Equalizer to use it again.",
+                        ));
+                    }
                 }
             }
         });
@@ -2030,6 +2063,12 @@ fn at_rest(rt: &Rt) -> bool {
 mod tests {
     use super::*;
     use crate::model::EFFECTS;
+
+    #[test]
+    fn about_says_which_build_this_is() {
+        assert_eq!(version_text("0.0.8", true), "0.0.8 (Flatpak)");
+        assert_eq!(version_text("0.0.8", false), "0.0.8 (native)");
+    }
 
     #[test]
     fn the_graphs_rest_only_once_a_whole_minute_shows_nothing_moving() {
